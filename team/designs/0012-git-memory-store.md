@@ -87,7 +87,7 @@ The `metadata` fields come from the `ModelExtractor` when automatic extraction i
 
 Required by the `MemoryStore` interface. Performs keyword matching (grep) against filenames, `description` frontmatter, and file content, excluding `knowledge/system/` (already loaded in full). Returns the top matches as `MemoryEntry[]`, ranked by term frequency. No model call, no embeddings.
 
-Progressive disclosure (see [Progressive Disclosure](#progressive-disclosure)) is the primary retrieval mechanism for GitMemoryStore — the agent sees the file tree in its system prompt and navigates knowledge directly using filesystem tools. The `search_memory` tool serves as a fallback: it retrieves actual content in a single tool call, preventing hallucination in cases where the agent might respond based on filenames/descriptions alone without reading the underlying files.
+Progressive disclosure (see [Progressive Disclosure](#progressive-disclosure)) is the primary retrieval mechanism for GitMemoryStore — the agent sees the file tree in its system prompt and navigates knowledge directly using filesystem tools. The [`search_memory` tool](https://github.com/strands-agents/docs/blob/main/designs/0011-memory-manager.md) serves as a fallback: it retrieves actual content in a single tool call, preventing hallucination in cases where the agent might respond based on filenames/descriptions alone without reading the underlying files.
 
 ### Integration with Existing Features
 
@@ -200,7 +200,7 @@ await memoryManager.consolidate({
 });
 ```
 
-See [Appendix B](#appendix-b-github-action-yaml) for a GitHub Action example
+Scheduling frequency is controlled externally by the GitHub Action or cron job. See [Appendix B](#appendix-b-github-action-yaml) for a GitHub Action example.
 
 See [Appendix C](#appendix-c-consolidation-examples) for the full usage script with nightly vs. weekly patterns for option 2.
 
@@ -463,26 +463,7 @@ Agent calls: readFile("knowledge/facts/deploy-process.md")
 </details>
 
 <details>
-  <summary><b>Appendix E: Alternative Consolidation Trigger</b></summary>
-
-Instead of a standalone script or GitHub Action, consolidation could be triggered via an agent lifecycle hook — running the same `consolidate()` method at session end:
-
-```typescript
-agent.addHook(AfterSessionEvent, async () => {
-  await memoryManager.consolidate({
-    model,
-    operations: ["deduplicate", "resolve-contradictions"],
-    scope: "since-last",
-  });
-});
-```
-
-This uses the existing `consolidate()` API. The tradeoff: consolidation blocks session teardown and adds latency at session end. The standalone script approach remains the primary recommendation for its flexibility (controllable scheduling, no session dependency, can run in CI), but a hook-based trigger is a simpler option for developers who don't want to set up external scheduling.
-
-</details>
-
-<details>
-  <summary><b>Appendix F: Success Criteria & Benchmarks</b></summary>
+  <summary><b>Appendix E: Success Criteria & Benchmarks</b></summary>
 
 ### Deep Memory Retrieval (DMR)
 
