@@ -20,7 +20,7 @@ MemoryManager already handles extraction (promoting observations into long-term 
 
 A file-based memory system addresses these issues by organizing knowledge as a structured file hierarchy that the agent can navigate directly. By abstracting the storage layer behind a `FileBackend` interface, the same file-based memory system can be backed by a local filesystem, a git repository, S3, or any other store that supports basic file operations. A developer-invoked consolidation agent provides the missing maintenance mechanism — it reads accumulated knowledge, deduplicates redundant entries, resolves contradictions, and reorganizes files, running offline so it doesn't add latency to agent sessions.
 
-The existing `BedrockKnowledgeBaseStore` addresses retrieval via managed vector search, but requires provisioned AWS infrastructure (Bedrock Knowledge Base, credentials, optional S3). This is well-suited for production and enterprise deployments where teams already have AWS infrastructure. `FileMemoryStore` targets the other end: individual developers, local-first agents, prototyping, and environments where standing up a managed service is unnecessary overhead. It requires zero external infrastructure, just a filesystem.
+The existing `BedrockKnowledgeBaseStore` addresses retrieval via managed vector search, but requires provisioned AWS infrastructure (Bedrock Knowledge Base, credentials, optional S3). This is well-suited for production and enterprise deployments where teams already have AWS infrastructure. `FileMemoryStore` targets the other end: individual developers, prototyping, and environments where standing up a managed service is unnecessary overhead. It requires zero external infrastructure, just a filesystem.
 
 ---
 
@@ -52,10 +52,6 @@ agent_memory/
 │   └── skills/
 │       ├── debugging.md
 │       └── code-review.md
-├── .versions/                       # snapshots of overwritten/deleted files
-│   └── knowledge/facts/dark-mode.md/
-│       └── 1718234000000
-├── .journal                         # append-only write log (path, timestamp, operation)
 └── consolidation/
     └── changelog.md                 # human-readable log of consolidation
 ```
@@ -126,13 +122,25 @@ interface FileBackend {
   delete(path: string): Promise<void>;
   list(prefix?: string): Promise<FileEntry[]>;
   exists(path: string): Promise<boolean>;
+
+  // Versioning — each backend implements with its native mechanism
+  changesSince(timestamp: number): Promise<FileChange[]>;
+  rollback(path: string, timestamp: number): Promise<void>;
 }
 
 interface FileEntry {
   path: string;
   isDirectory: boolean;
 }
+
+interface FileChange {
+  path: string;
+  timestamp: number;
+  operation: "write" | "delete";
+}
 ```
+
+**`changesSince(timestamp)`** returns all writes and deletes that occurred after the given timestamp. Consolidation uses this to scope work (`"since-last"`) and to provide recency context to the agent. **`rollback(path, timestamp)`** restores a file to its state at the given timestamp — used to undo bad consolidation.
 
 #### Example Usage: LocalFileBackend
 
@@ -144,12 +152,16 @@ class LocalFileBackend implements FileBackend {
     this.rootPath = rootPath;
   }
 
-  // Each method joins this.rootPath with the relative path to form the full path, ex: fs.readFile(join(this.rootPath, path)) for read()
+  // File operations — each joins this.rootPath with the relative path
   async read(path: string): Promise<string> {}
   async write(path: string, content: string): Promise<void> {}
   async delete(path: string): Promise<void> {}
   async list(prefix?: string): Promise<FileEntry[]> {}
   async exists(path: string): Promise<boolean> {}
+
+  // Versioning — implemented via .versions/ snapshots and .journal
+  async changesSince(timestamp: number): Promise<FileChange[]> {}
+  async rollback(path: string, timestamp: number): Promise<void> {}
 }
 ```
 
@@ -212,10 +224,15 @@ Progressive disclosure (see [Progressive Disclosure](#progressive-disclosure)) i
 
 ### Versioning
 
-`FileMemoryStore` handles version history at the store level, independent of the backend:
+Versioning is a backend responsibility — each backend implements `changesSince()` and `rollback()` using whatever mechanism is native to its storage:
 
-- **Write journal**: Every `write` and `delete` appends an entry (path, timestamp, operation) to an internal journal file. This powers `scope: "since-last"` in consolidation.
-- **Snapshots**: Before overwriting or deleting a file, the previous content is copied to a `.versions/{path}/{timestamp}` location. This enables rollback (read a previous snapshot, write it back) and diffing (compare two snapshots) on any backend.
+| Backend | How it versions |
+|---------|----------------|
+| `GitFileBackend` | `git log`, `git show`, `git revert` — free, built into the storage |
+| `LocalFileBackend` | Copies previous content to `.versions/{path}/{timestamp}` before overwriting; maintains a `.journal` file for `changesSince()` |
+| `S3FileBackend` | S3 object versioning — managed by the service |
+
+`FileMemoryStore` doesn't implement versioning itself — it calls `this.backend.rollback()` or `this.backend.changesSince()` and lets the backend decide how. This avoids redundant work for backends that already version natively (git, S3) while still supporting backends that don't (local filesystem).
 
 
 ### Integration with Existing Features
@@ -248,7 +265,7 @@ Custom backends implement the `FileBackend` interface. See [Appendix C](#appendi
 
 ## Consolidation
 
-Consolidation improves memory quality after facts accumulate. It is a developer-invoked Strands agent exposed as a method on `MemoryManager` (defined under `src/memory/consolidation/`). It reads stored knowledge, reasons across files, and writes changes through the `FileBackend`. Every change is recorded in the store's version history, so bad consolidation is trivially reversible.
+Consolidation improves memory quality after facts accumulate. It is a developer-invoked Strands agent exposed as a method on `MemoryManager` (defined under `src/memory/consolidation/`). It reads stored knowledge, reasons across files, and writes changes through the `FileBackend`. Every change is versioned by the backend (via `history()`/`rollback()`), so bad consolidation is trivially reversible.
 
 All extracted facts land in `knowledge/facts/` by default — `FileMemoryStore.add()` writes there unconditionally for simplicity and to avoid a classification model call on every extraction. Consolidation is therefore responsible for reorganizing files into appropriate subdirectories (`skills/`, `system/`, etc.) during offline maintenance, when it has full cross-file context to make informed categorization decisions.
 
@@ -259,7 +276,7 @@ memoryManager.consolidate(config)
 │
 ├─ 1. SCOPE: determine which files to process
 │     scope: "since-last" → read last consolidation timestamp from changelog.md,
-│                            then filter .journal for files written/deleted after that timestamp
+│                            then call backend.changesSince(timestamp) to get modified files
 │     scope: "all"        → everything in knowledge/
 │
 ├─ 2. CLUSTER: group eligible files by subdirectory
@@ -275,8 +292,8 @@ memoryManager.consolidate(config)
 │     - model:         the LLM passed in config (does the reasoning)
 │     - system prompt: built from config.operations (e.g. "deduplicate", "prune")
 │     - tools:         readFile, writeFile, deleteFile (thin wrappers around this.backend)
-│     - context:       the .journal entries for files in this cluster (provides timestamps
-│                      so the agent can reason about recency for prune/resolve operations)
+│     - context:       the FileChange[] entries for this cluster (from step 1), providing
+│                      timestamps so the agent can reason about recency
 │
 │     The agent reads the cluster's files, applies the requested operations, and writes
 │     changes back through the FileBackend.
@@ -287,12 +304,12 @@ memoryManager.consolidate(config)
 
 ### Operations
 
-The `operations` config controls which directives go into the agent's system prompt. They are prompt instructions — the LLM decides how to apply them using the file content and journal timestamps available in its context.
+The `operations` config controls which directives go into the agent's system prompt. They are prompt instructions — the LLM decides how to apply them using the file content and change history available in its context.
 
 | Operation | Agent behavior | Example |
 |-----------|---------------|---------|
 | `deduplicate` | Merge files expressing the same fact | "User prefers dark mode" + "Theme preference: dark" → one file |
-| `resolve-contradictions` | Keep the more recent fact (per journal timestamps), delete the other | "Uses tabs" (April) vs "Uses spaces" (June) → keeps spaces |
+| `resolve-contradictions` | Keep the more recent fact (per change history), delete the other | "Uses tabs" (April) vs "Uses spaces" (June) → keeps spaces |
 | `derive-insights` | Combine related facts into a higher-level pattern | 3 testing facts → "Testing philosophy: high-fidelity, boundary-mocked" |
 | `prune` | Delete entries whose content is fully covered by a newer file | `old-deploy-process.md` superseded by `deploy-process.md` → deleted |
 | `reorganize` | Move files to appropriate subdirectories based on content | Fact about debugging patterns in `facts/` → moved to `skills/debugging.md` |
@@ -518,6 +535,24 @@ const agent = new Agent({
 ```
 
 The developer gets `git log`, `git diff`, and `git revert` for free — same memory model, git-native audit trail.
+
+### Versioning Interface in Practice
+
+The versioning methods on `FileBackend` are called by `FileMemoryStore` during consolidation and rollback. Here's how they're used with the git backend:
+
+```typescript
+const backend = new GitFileBackend({ rootPath: "./.agent-memory" });
+
+// Scoping: get all files that changed since a timestamp (used by consolidation "since-last")
+const changes = await backend.changesSince(1718234000);
+// → [{ path: "knowledge/facts/dark-mode.md", timestamp: 1718234500, operation: "write" },
+//    { path: "knowledge/facts/old-process.md", timestamp: 1718300000, operation: "delete" }]
+
+// Rollback: restore a file to its state at a prior timestamp (used to undo bad consolidation)
+await backend.rollback("knowledge/facts/editor-preferences.md", 1718234000);
+```
+
+For `GitFileBackend`, `changesSince()` maps to `git log --since` and `rollback()` maps to `git show <commit>:<path>` + write. For `LocalFileBackend`, these use the `.journal` file and `.versions/` snapshots respectively.
 
 </details>
 
