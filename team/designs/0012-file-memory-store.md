@@ -32,6 +32,83 @@ The storage backend is abstracted behind a `FileBackend` interface — any syste
 
 The existing Strands API remains unchanged. `ContextManager` still owns L0 <--> L1, `MemoryManager` still owns L1 --> L2. What changes is the physical storage: instead of separate, disconnected backends for each layer, both write to the same file hierarchy. Every write from any layer is routed through the `FileBackend`, which determines how persistence, history, and atomicity are handled.
 
+### File Hierarchy
+
+Both the `ContextManager` and `MemoryManager` write to the same file hierarchy but are isolated by path: L1 writes to `sessions/`, while L2 writes to `knowledge/`. Consolidation metadata lives in `consolidation/`.
+
+```
+agent_memory/
+├── sessions/                        # L1 - ContextManager writes here
+│   ├── current.md
+│   └── history/
+│       ├── 2026-06-10-session-a.md
+│       └── 2026-06-11-session-b.md
+├── knowledge/                       # L2 - MemoryManager writes here
+│   ├── system/                      # always loaded in full every turn
+│   │   └── user-preferences.md
+│   ├── facts/                       # visible by name + description; loaded on demand
+│   │   ├── testing-philosophy.md
+│   │   └── project-context.md
+│   └── skills/
+│       ├── debugging.md
+│       └── code-review.md
+└── consolidation/
+    └── changelog.md                 # human-readable log of consolidation
+```
+
+---
+
+## Progressive Disclosure
+
+Not everything loads into context every turn. The agent retrieves relevant knowledge on demand by navigating the file hierarchy directly. LLMs are precise and accurate at scoped filesystem calls (listing directories, grepping for keywords, reading specific files), and progressive disclosure leverages this skill as the primary retrieval mechanism.
+
+### How It Works
+
+`FileMemoryStore` registers two things on the agent at initialization:
+
+**1. The file tree (always in the system prompt)**
+
+The full directory listing of `knowledge/` with each file's `description` frontmatter is injected into the agent's system prompt every turn. The agent always knows what knowledge exists without loading the content:
+
+```
+knowledge/
+├── system/                          [loaded in full]
+│   └── user-preferences.md         — "Core preferences: editor, language, testing style"
+├── facts/
+│   ├── testing-philosophy.md       — "Integration-first, mock at boundaries"
+│   ├── deploy-process.md           — "Team's deployment pipeline and rollback procedures"
+│   └── project-architecture.md     — "Service boundaries and data flow"
+└── skills/
+    └── code-review.md              — "Patterns for reviewing PRs: what to flag, what to skip"
+```
+
+
+### Context Loading
+
+Files in `knowledge/system/` are always loaded in full into the system prompt. This is where core context lives (persona, key preferences, critical project facts). Everything outside `system/` is visible by filename + description only, loaded when the agent reads it.
+
+**Who manages `system/`:** Developers seed `system/` at repo creation with anything the agent always needs (persona, core preferences). The consolidation agent promotes and demotes files during offline maintenance, analyzing cross-session patterns to move broadly relevant files into `system/` and overly specific ones out. The main agent never writes to `system/` during a session.
+
+### Retrieval in Practice
+
+The agent uses the file tree to judge relevance by filename and description, then loads specific files with `readFile` or searches across files with `grep`. For a targeted question, it reads a single matching file. For a broader query, it greps across `knowledge/`, then reads the best matches. See [Appendix D](#appendix-d-retrieval-worked-examples) for worked examples.
+
+### File Format
+
+Knowledge files are markdown with YAML frontmatter containing one field — `description`. The description is always visible in the file tree, letting the agent judge relevance without reading every file:
+
+```markdown
+---
+description: "How the user approaches testing: integration-first, mock at boundaries"
+---
+
+- Prefers integration tests over unit tests for API layers
+- Uses VS Code with vim keybindings
+- Mocks external services at the HTTP boundary, not at the module level
+```
+
+---
+
 ### Architecture
 
 #### FileBackend Interface
@@ -104,8 +181,6 @@ class FileMemoryStore implements Storage, MemoryStore {
 }
 ```
 
-
-
 ### Method Behavior
 
 **`store(key, content, contentType?)`**
@@ -165,29 +240,6 @@ const agent = new Agent({
 
 Custom backends implement the `FileBackend` interface. See [Appendix E](#appendix-e-git-based-memory) for an example git-based implementation.
 
-### File Hierarchy
-
-Both the `ContextManager` and `MemoryManager` write to the same file hierarchy but are isolated by path: L1 writes to `sessions/`, while L2 writes to `knowledge/`. Consolidation metadata lives in `consolidation/`.
-
-```
-agent_memory/
-├── sessions/                        # L1 - ContextManager writes here
-│   ├── current.md
-│   └── history/
-│       ├── 2026-06-10-session-a.md
-│       └── 2026-06-11-session-b.md
-├── knowledge/                       # L2 - MemoryManager writes here
-│   ├── system/                      # always loaded in full every turn
-│   │   └── user-preferences.md
-│   ├── facts/                       # visible by name + description; loaded on demand
-│   │   ├── testing-philosophy.md
-│   │   └── project-context.md
-│   └── skills/
-│       ├── debugging.md
-│       └── code-review.md
-└── consolidation/
-    └── changelog.md                 # human-readable log of consolidation
-```
 ---
 
 ## Consolidation
@@ -258,57 +310,6 @@ Appendix B shows an example consolidation trigger using a GitHub Action.
 ### Output
 
 Each operation is recorded as a versioned change with a descriptive message (e.g., `Consolidate(deduplicate): merge dark-mode.md into editor-preferences.md`). A summary is appended to `consolidation/changelog.md`, which serves as both an audit log and the cursor for `scope: "since-last"`. See [Appendix C](#appendix-c-consolidation-examples) for example output.
-
----
-
-## Progressive Disclosure
-
-Not everything loads into context every turn. The agent retrieves relevant knowledge on demand by navigating the file hierarchy directly. LLMs are precise and accurate at scoped filesystem calls (listing directories, grepping for keywords, reading specific files), and progressive disclosure leverages this skill as the primary retrieval mechanism.
-
-### How It Works
-
-`FileMemoryStore` registers two things on the agent at initialization:
-
-**1. The file tree (always in the system prompt)**
-
-The full directory listing of `knowledge/` with each file's `description` frontmatter is injected into the agent's system prompt every turn. The agent always knows what knowledge exists without loading the content:
-
-```
-knowledge/
-├── system/                          [loaded in full]
-│   └── user-preferences.md         — "Core preferences: editor, language, testing style"
-├── facts/
-│   ├── testing-philosophy.md       — "Integration-first, mock at boundaries"
-│   ├── deploy-process.md           — "Team's deployment pipeline and rollback procedures"
-│   └── project-architecture.md     — "Service boundaries and data flow"
-└── skills/
-    └── code-review.md              — "Patterns for reviewing PRs: what to flag, what to skip"
-```
-
-
-### Context Loading
-
-Files in `knowledge/system/` are always loaded in full into the system prompt. This is where core context lives (persona, key preferences, critical project facts). Everything outside `system/` is visible by filename + description only, loaded when the agent reads it.
-
-**Who manages `system/`:** Developers seed `system/` at repo creation with anything the agent always needs (persona, core preferences). The consolidation agent promotes and demotes files during offline maintenance, analyzing cross-session patterns to move broadly relevant files into `system/` and overly specific ones out. The main agent never writes to `system/` during a session.
-
-### Retrieval in Practice
-
-The agent uses the file tree to judge relevance by filename and description, then loads specific files with `readFile` or searches across files with `grep`. For a targeted question, it reads a single matching file. For a broader query, it greps across `knowledge/`, then reads the best matches. See [Appendix D](#appendix-d-retrieval-worked-examples) for worked examples.
-
-### File Format
-
-Knowledge files are markdown with YAML frontmatter containing one field — `description`. The description is always visible in the file tree, letting the agent judge relevance without reading every file:
-
-```markdown
----
-description: "How the user approaches testing: integration-first, mock at boundaries"
----
-
-- Prefers integration tests over unit tests for API layers
-- Uses VS Code with vim keybindings
-- Mocks external services at the HTTP boundary, not at the module level
-```
 
 ---
 
