@@ -20,7 +20,7 @@ MemoryManager already handles extraction (promoting observations into long-term 
 
 A file-based memory system addresses these issues by organizing knowledge as a structured file hierarchy that the agent can navigate directly. By abstracting the storage layer behind a `FileBackend` interface, the same file-based memory system can be backed by a local filesystem, a git repository, S3, or any other store that supports basic file operations. A developer-invoked consolidation agent provides the missing maintenance mechanism — it reads accumulated knowledge, deduplicates redundant entries, resolves contradictions, and reorganizes files, running offline so it doesn't add latency to agent sessions.
 
-Additionally, the existing `BedrockKnowledgeBaseStore` addresses retrieval via managed vector search, but requires provisioned AWS infrastructure (Bedrock Knowledge Base, credentials, optional S3). This is well-suited for production and enterprise deployments where teams already have AWS infrastructure. `FileMemoryStore` targets the other end: individual developers, local-first agents, prototyping, and environments where standing up a managed service is unnecessary overhead. It requires zero external infrastructure — just a filesystem.
+The existing `BedrockKnowledgeBaseStore` addresses retrieval via managed vector search, but requires provisioned AWS infrastructure (Bedrock Knowledge Base, credentials, optional S3). This is well-suited for production and enterprise deployments where teams already have AWS infrastructure. `FileMemoryStore` targets the other end: individual developers, local-first agents, prototyping, and environments where standing up a managed service is unnecessary overhead. It requires zero external infrastructure, just a filesystem.
 
 ---
 
@@ -52,6 +52,10 @@ agent_memory/
 │   └── skills/
 │       ├── debugging.md
 │       └── code-review.md
+├── .versions/                       # snapshots of overwritten/deleted files
+│   └── knowledge/facts/dark-mode.md/
+│       └── 1718234000000
+├── .journal                         # append-only write log (path, timestamp, operation)
 └── consolidation/
     └── changelog.md                 # human-readable log of consolidation
 ```
@@ -91,7 +95,7 @@ Files in `knowledge/system/` are always loaded in full into the system prompt. T
 
 ### Retrieval in Practice
 
-The agent uses the file tree to judge relevance by filename and description, then loads specific files with `readFile` or searches across files with `grep`. For a targeted question, it reads a single matching file. For a broader query, it greps across `knowledge/`, then reads the best matches. See [Appendix D](#appendix-d-retrieval-worked-examples) for worked examples.
+The agent uses the file tree to judge relevance by filename and description, then loads specific files with `readFile` or searches across files with `grep`. For a targeted question, it reads a single matching file. For a broader query, it greps across `knowledge/`, then reads the best matches. See [Appendix A](#appendix-a-retrieval-worked-examples) for worked examples.
 
 ### File Format
 
@@ -198,7 +202,7 @@ Writes a new markdown file to `knowledge/facts/`. No model call.
 - **Filename:** `metadata.title` if present, otherwise first few words of the content plus a timestamp (e.g., `testing-preferences.md` or `user-prefers-dark-mode-1718234.md`)
 - **Frontmatter `description`:** `metadata.description` if present, otherwise first sentence of the content
 
-The `metadata` fields come from the `ModelExtractor` when automatic extraction is configured — its system prompt instructs it to produce a title and description for each extracted fact (see [Appendix A](#appendix-a-extraction-configuration) for the configuration example). When the agent uses the `store_memory` tool instead (explicit write), no extractor is involved — `add()` receives raw content with no metadata and falls back to deriving both from the content.
+The `metadata` fields come from the `ModelExtractor` when automatic extraction is configured — its system prompt instructs it to produce a title and description for each extracted fact (see [Appendix B](#appendix-b-extraction-configuration) for the configuration example). When the agent uses the `store_memory` tool instead (explicit write), no extractor is involved — `add()` receives raw content with no metadata and falls back to deriving both from the content.
 
 **`search(query, options?)`**
 
@@ -224,7 +228,7 @@ import { FileMemoryStore, LocalFileBackend } from "@strands-agents/sdk/memory";
 
 const myStore = new FileMemoryStore({
     name: "agent-memory",
-    backend: new LocalFileBackend({ rootPath: "./.agent-memory" }),
+    backend: new LocalFileBackend({ rootPath: "./.agent-memory" }),  // assuming LocalFileBackend example from above
 });
 
 const agent = new Agent({
@@ -238,7 +242,7 @@ const agent = new Agent({
 });
 ```
 
-Custom backends implement the `FileBackend` interface. See [Appendix E](#appendix-e-git-based-memory) for an example git-based implementation.
+Custom backends implement the `FileBackend` interface. See [Appendix C](#appendix-c-git-based-memory) for an example git-based implementation.
 
 ---
 
@@ -253,33 +257,44 @@ All extracted facts land in `knowledge/facts/` by default — `FileMemoryStore.a
 ```
 memoryManager.consolidate(config)
 │
-├─ 1. SCOPE: find eligible files
-│     scope: "since-last" → files modified since last run (reads last timestamp from consolidation/changelog.md)
+├─ 1. SCOPE: determine which files to process
+│     scope: "since-last" → read last consolidation timestamp from changelog.md,
+│                            then filter .journal for files written/deleted after that timestamp
 │     scope: "all"        → everything in knowledge/
 │
-├─ 2. CLUSTER: group files by subdirectory
+├─ 2. CLUSTER: group eligible files by subdirectory
+│     Clustering keeps each agent invocation focused on related files — a cluster of
+│     testing facts can be deduplicated, but mixing testing facts with deploy procedures
+│     would force the agent to reason across unrelated topics in a single pass.
+│
 │     cluster 1 (facts/): [dark-mode.md, editor-preferences.md, deploy-process.md]
 │     cluster 2 (skills/): [debugging.md, code-review.md]
 │
-├─ 3. EXECUTE: create one Strands agent, invoke it once per cluster:
-│     - model:        the LLM passed in config (does the reasoning)
+├─ 3. EXECUTE: for each cluster, invoke a Strands agent
+│     Each agent invocation receives:
+│     - model:         the LLM passed in config (does the reasoning)
 │     - system prompt: built from config.operations (e.g. "deduplicate", "prune")
-│     - tools:        readFile, writeFile, deleteFile (thin wrappers around this.backend.read/write/delete)
-│     → for each cluster, agent reads files, applies operations, writes changes
+│     - tools:         readFile, writeFile, deleteFile (thin wrappers around this.backend)
+│     - context:       the .journal entries for files in this cluster (provides timestamps
+│                      so the agent can reason about recency for prune/resolve operations)
+│
+│     The agent reads the cluster's files, applies the requested operations, and writes
+│     changes back through the FileBackend.
 │
 └─ 4. RECORD: append timestamp + summary to consolidation/changelog.md
+       This serves as both an audit log and the cursor for the next "since-last" run.
 ```
 
 ### Operations
 
-The `operations` config controls which directives go into the agent's system prompt. They are prompt instructions — the LLM decides how to apply them.
+The `operations` config controls which directives go into the agent's system prompt. They are prompt instructions — the LLM decides how to apply them using the file content and journal timestamps available in its context.
 
 | Operation | Agent behavior | Example |
 |-----------|---------------|---------|
 | `deduplicate` | Merge files expressing the same fact | "User prefers dark mode" + "Theme preference: dark" → one file |
-| `resolve-contradictions` | Keep the more recent/confident fact, delete the other | "Uses tabs" (April) vs "Uses spaces" (June) → keeps spaces |
+| `resolve-contradictions` | Keep the more recent fact (per journal timestamps), delete the other | "Uses tabs" (April) vs "Uses spaces" (June) → keeps spaces |
 | `derive-insights` | Combine related facts into a higher-level pattern | 3 testing facts → "Testing philosophy: high-fidelity, boundary-mocked" |
-| `prune` | Delete stale/superseded entries | Fact with `access_count: 1`, last accessed 90 days ago → deleted |
+| `prune` | Delete entries whose content is fully covered by a newer file | `old-deploy-process.md` superseded by `deploy-process.md` → deleted |
 | `reorganize` | Move files to appropriate subdirectories based on content | Fact about debugging patterns in `facts/` → moved to `skills/debugging.md` |
 
 ### Usage
@@ -303,13 +318,7 @@ await memoryManager.consolidate({
 });
 ```
 
-Scheduling frequency is controlled by the developer — e.g., after each session for incremental cleanup, or weekly for a deep clean. See [Appendix C](#appendix-c-consolidation-examples) for the nightly vs. weekly patterns for option 2.
-
-Appendix B shows an example consolidation trigger using a GitHub Action. 
-
-### Output
-
-Each operation is recorded as a versioned change with a descriptive message (e.g., `Consolidate(deduplicate): merge dark-mode.md into editor-preferences.md`). A summary is appended to `consolidation/changelog.md`, which serves as both an audit log and the cursor for `scope: "since-last"`. See [Appendix C](#appendix-c-consolidation-examples) for example output.
+Scheduling frequency is controlled by the developer — e.g., after each session for incremental cleanup, or weekly for a deep clean. See [Appendix D](#appendix-d-consolidation-examples) for the nightly vs. weekly patterns for option 2, and [Appendix E](#appendix-e-github-action-yaml) for an example GitHub Action trigger.
 
 ---
 
@@ -377,102 +386,7 @@ Yes.
 
 ---
 <details>
-  <summary><b>Appendix A: Extraction Configuration</b></summary>
-
-```typescript
-const myStore = new FileMemoryStore({
-  name: "agent-memory",
-  backend: new LocalFileBackend({ rootPath: "./.agent-memory" }),
-  extraction: {
-    triggers: [new InvocationTrigger()],
-    extractor: new ModelExtractor({
-      model,
-      systemPrompt: `Extract discrete facts from the conversation. For each fact, return:
-- content: the fact itself
-- metadata.title: a 2-4 word slug (e.g., "testing-preferences")
-- metadata.description: a one-line summary for discoverability`,
-    }),
-  },
-});
-```
-
-</details>
-
-<details>
-  <summary><b>Appendix B: GitHub Action YAML</b></summary>
-
-```yaml
-# .github/workflows/consolidate.yml
-name: Memory Consolidation
-
-on:
-  schedule:
-    - cron: "0 2 * * *" # nightly
-  workflow_dispatch: # manual trigger
-
-jobs:
-  consolidate:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: npx strands-memory consolidate --path ./.agent-memory
-      - run: |
-          git config user.name "strands-consolidation[bot]"
-          git config user.email "consolidation@users.noreply.github.com"
-      - run: git diff --quiet || (git add . && git commit -m "Consolidate: nightly maintenance" && git push)
-```
-
-</details>
-
-<details>
-  <summary><b>Appendix C: Consolidation Examples</b></summary>
-
-### Full Usage Script
-
-```typescript
-// consolidate.ts — run via cron, GitHub Action, or manually
-import { MemoryManager } from "@strands-agents/sdk";
-import { FileMemoryStore, LocalFileBackend } from "@strands-agents/sdk/memory";
-
-const myStore = new FileMemoryStore({
-  name: "agent-memory",
-  backend: new LocalFileBackend({ rootPath: "./.agent-memory" }),
-});
-
-const memoryManager = new MemoryManager({ stores: [myStore] });
-
-// Nightly incremental (cheap — only processes new files)
-await memoryManager.consolidate({
-  model,
-  operations: ["deduplicate", "resolve-contradictions"],
-  scope: "since-last",
-});
-
-// Weekly deep clean (expensive — processes everything)
-await memoryManager.consolidate({
-  model,
-  operations: ["deduplicate", "resolve-contradictions", "derive-insights", "prune"],
-  scope: "all",
-});
-```
-
-### Example Output
-
-Each operation is recorded in `consolidation/changelog.md` (serves as both audit log and cursor for `scope: "since-last"`):
-
-```markdown
-## 2026-06-15 02:00 (nightly)
-- Consolidate(deduplicate): merged `facts/dark-mode.md` into `facts/editor-preferences.md`
-- Consolidate(resolve): kept "uses spaces" over "uses tabs" (recency: June vs April)
-- Consolidate(derive): synthesized `facts/testing-philosophy.md` from 3 entries
-- Consolidate(prune): deleted `facts/old-deploy-process.md` (last accessed 2026-03-01, access_count: 1)
-```
-
-
-</details>
-
-<details>
-  <summary><b>Appendix D: Retrieval Worked Examples</b></summary>
+  <summary><b>Appendix A: Retrieval Worked Examples</b></summary>
 
 ```
 User asks: "how should I structure these tests?"
@@ -507,7 +421,29 @@ Agent calls: search_memory("retry failed requests")
 </details>
 
 <details>
-  <summary><b>Appendix E: Git-Based Memory (Original Design)</b></summary>
+  <summary><b>Appendix B: Extraction Configuration</b></summary>
+
+```typescript
+const myStore = new FileMemoryStore({
+  name: "agent-memory",
+  backend: new LocalFileBackend({ rootPath: "./.agent-memory" }),
+  extraction: {
+    triggers: [new InvocationTrigger()],
+    extractor: new ModelExtractor({
+      model,
+      systemPrompt: `Extract discrete facts from the conversation. For each fact, return:
+- content: the fact itself
+- metadata.title: a 2-4 word slug (e.g., "testing-preferences")
+- metadata.description: a one-line summary for discoverability`,
+    }),
+  },
+});
+```
+
+</details>
+
+<details>
+  <summary><b>Appendix C: Git-Based Memory (Original Design)</b></summary>
 
 The original design for this proposal was a `GitMemoryStore` — a single class backed directly by a git repository. Every write produced a git commit, rollback was `git revert`, and the full audit trail lived in `git log`. Consolidation used git worktrees for concurrent operations and `git diff` for developer debugging.
 
@@ -586,13 +522,79 @@ The developer gets `git log`, `git diff`, and `git revert` for free — same mem
 </details>
 
 <details>
-  <summary><b>Appendix F: Fill in or delete breh</b></summary>
+  <summary><b>Appendix D: Consolidation Examples</b></summary>
 
+### Full Usage Script
+
+```typescript
+// consolidate.ts — run via cron, GitHub Action, or manually
+import { MemoryManager } from "@strands-agents/sdk";
+import { FileMemoryStore, LocalFileBackend } from "@strands-agents/sdk/memory";
+
+const myStore = new FileMemoryStore({
+  name: "agent-memory",
+  backend: new LocalFileBackend({ rootPath: "./.agent-memory" }),
+});
+
+const memoryManager = new MemoryManager({ stores: [myStore] });
+
+// Nightly incremental (cheap — only processes new files)
+await memoryManager.consolidate({
+  model,
+  operations: ["deduplicate", "resolve-contradictions"],
+  scope: "since-last",
+});
+
+// Weekly deep clean (expensive — processes everything)
+await memoryManager.consolidate({
+  model,
+  operations: ["deduplicate", "resolve-contradictions", "derive-insights", "prune"],
+  scope: "all",
+});
+```
+
+### Example Output
+
+Each operation is recorded in `consolidation/changelog.md` (serves as both audit log and cursor for `scope: "since-last"`):
+
+```markdown
+## 2026-06-15 02:00 (nightly)
+- Consolidate(deduplicate): merged `facts/dark-mode.md` into `facts/editor-preferences.md`
+- Consolidate(resolve): kept "uses spaces" over "uses tabs" (recency: June vs April)
+- Consolidate(derive): synthesized `facts/testing-philosophy.md` from 3 entries
+- Consolidate(prune): deleted `facts/old-deploy-process.md` (last written 2026-03-01, superseded by `facts/deploy-process.md`)
+```
 
 </details>
 
 <details>
-  <summary><b>Appendix G: Success Criteria & Benchmarks</b></summary>
+  <summary><b>Appendix E: GitHub Action YAML</b></summary>
+
+```yaml
+# .github/workflows/consolidate.yml
+name: Memory Consolidation
+
+on:
+  schedule:
+    - cron: "0 2 * * *" # nightly
+  workflow_dispatch: # manual trigger
+
+jobs:
+  consolidate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npx strands-memory consolidate --path ./.agent-memory
+      - run: |
+          git config user.name "strands-consolidation[bot]"
+          git config user.email "consolidation@users.noreply.github.com"
+      - run: git diff --quiet || (git add . && git commit -m "Consolidate: nightly maintenance" && git push)
+```
+
+</details>
+
+<details>
+  <summary><b>Appendix F: Benchmarks To Test</b></summary>
 
 ### Deep Memory Retrieval (DMR)
 
