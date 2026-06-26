@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { FileMemoryStore } from '../file-memory-store.js'
+import type { InvokableTool } from '../../../tools/tool.js'
 import type { FileBackend, FileChange, FileEntry } from '../types.js'
 
 /**
@@ -167,21 +168,21 @@ describe('FileMemoryStore', () => {
 
     it('reads a knowledge file and returns the body', async () => {
       const tools = store.getTools()
-      const readTool = tools[0]!
+      const readTool = tools[0]! as unknown as InvokableTool<unknown, unknown>
       const result = await readTool.invoke({ path: 'knowledge/facts/mocking-rules.md' })
       expect(result).toContain('Mock at HTTP boundaries only')
     })
 
     it('returns error for paths outside knowledge/', async () => {
       const tools = store.getTools()
-      const readTool = tools[0]!
+      const readTool = tools[0]! as unknown as InvokableTool<unknown, unknown>
       const result = await readTool.invoke({ path: 'sessions/secret.md' })
       expect(result).toContain('Error')
     })
 
     it('returns error for nonexistent files', async () => {
       const tools = store.getTools()
-      const readTool = tools[0]!
+      const readTool = tools[0]! as unknown as InvokableTool<unknown, unknown>
       const result = await readTool.invoke({ path: 'knowledge/facts/nonexistent.md' })
       expect(result).toContain('Error')
     })
@@ -195,7 +196,7 @@ describe('FileMemoryStore', () => {
 
     it('finds matching content across files', async () => {
       const tools = store.getTools()
-      const grepTool = tools[1]!
+      const grepTool = tools[1]! as unknown as InvokableTool<unknown, unknown>
       const result = await grepTool.invoke({ query: 'exponential backoff' })
       expect(result).toContain('retry-strategy')
       expect(result).toContain('exponential backoff')
@@ -203,7 +204,7 @@ describe('FileMemoryStore', () => {
 
     it('returns no matches message when nothing found', async () => {
       const tools = store.getTools()
-      const grepTool = tools[1]!
+      const grepTool = tools[1]! as unknown as InvokableTool<unknown, unknown>
       const result = await grepTool.invoke({ query: 'nonexistent term xyz' })
       expect(result).toBe('No matches found.')
     })
@@ -249,6 +250,19 @@ describe('FileMemoryStore', () => {
       await expect(
         store.consolidate({ model: {}, operations: ['deduplicate'], scope: 'all' })
       ).rejects.toThrow('not yet implemented')
+    })
+  })
+
+  describe('createInjector', () => {
+    it('returns a plugin with the expected name', () => {
+      const injector = store.createInjector()
+      expect(injector.name).toBe('strands:file-memory-injector:test-store')
+    })
+
+    it('returns a plugin instance', () => {
+      const injector = store.createInjector()
+      expect(injector).toBeDefined()
+      expect(typeof injector.initAgent).toBe('function')
     })
   })
 

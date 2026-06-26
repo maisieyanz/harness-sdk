@@ -10,7 +10,9 @@ import type { JSONValue } from '../../types/json.js'
 import type { MemoryEntry, MemoryStore, SearchOptions } from '../../memory/types.js'
 import type { ExtractionConfig } from '../../memory/extraction/types.js'
 import type { Tool } from '../../tools/tool.js'
+import type { Plugin } from '../../plugins/plugin.js'
 import type { FileBackend, FileMemoryStoreConfig, ConsolidateConfig } from './types.js'
+import { ContextInjector } from '../../vended-plugins/context-injector/plugin.js'
 import { tool } from '../../tools/tool-factory.js'
 
 const KNOWLEDGE_PREFIX = 'knowledge'
@@ -116,6 +118,40 @@ export class FileMemoryStore implements MemoryStore {
    */
   getTools(): Tool[] {
     return [this._readFileTool(), this._grepTool()]
+  }
+
+  /**
+   * Returns a {@link ContextInjector} plugin that injects the knowledge file tree and system
+   * knowledge into the model's context every user turn.
+   *
+   * Register this as a plugin on the agent alongside the {@link MemoryManager}. When using
+   * progressive disclosure, disable the MemoryManager's built-in injection (`injection: false`)
+   * and use this injector instead — the agent sees the file tree and navigates with tools.
+   *
+   * @returns A plugin that injects the file tree and system knowledge into the model context
+   */
+  createInjector(): Plugin {
+    return new ContextInjector({
+      name: `strands:file-memory-injector:${this.name}`,
+      trigger: 'everyTurn',
+      renderContent: async () => {
+        const [tree, systemKnowledge] = await Promise.all([this.renderFileTree(), this.loadSystemKnowledge()])
+
+        const parts: string[] = []
+
+        if (systemKnowledge) {
+          parts.push(`<memory-system>\n${systemKnowledge}\n</memory-system>`)
+        }
+
+        if (tree) {
+          parts.push(
+            `<memory-files>\n${tree}\n\nUse read_memory_file to load a file, or grep_memory to search content.\n</memory-files>`
+          )
+        }
+
+        return parts.length > 0 ? parts.join('\n\n') : undefined
+      },
+    })
   }
 
   /**
