@@ -246,10 +246,10 @@ describe('FileMemoryStore', () => {
   })
 
   describe('consolidate', () => {
-    it('throws not-yet-implemented error', async () => {
+    it('does nothing when no files are in scope', async () => {
       await expect(
-        store.consolidate({ model: {}, operations: ['deduplicate'], scope: 'all' })
-      ).rejects.toThrow('not yet implemented')
+        store.consolidate({ model: {} as any, operations: ['deduplicate'], scope: 'since-last' })
+      ).resolves.toBeUndefined()
     })
   })
 

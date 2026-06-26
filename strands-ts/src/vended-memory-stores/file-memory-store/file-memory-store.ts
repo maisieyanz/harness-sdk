@@ -11,9 +11,11 @@ import type { MemoryEntry, MemoryStore, SearchOptions } from '../../memory/types
 import type { ExtractionConfig } from '../../memory/extraction/types.js'
 import type { Tool } from '../../tools/tool.js'
 import type { Plugin } from '../../plugins/plugin.js'
-import type { FileBackend, FileMemoryStoreConfig, ConsolidateConfig } from './types.js'
+import type { FileBackend, FileMemoryStoreConfig, ConsolidateConfig, ConsolidationOperation } from './types.js'
+import { Agent } from '../../agent/agent.js'
 import { ContextInjector } from '../../vended-plugins/context-injector/plugin.js'
 import { tool } from '../../tools/tool-factory.js'
+import { logger } from '../../logging/logger.js'
 
 const KNOWLEDGE_PREFIX = 'knowledge'
 const SYSTEM_PREFIX = `${KNOWLEDGE_PREFIX}/system`
@@ -186,10 +188,25 @@ export class FileMemoryStore implements MemoryStore {
    * Run offline consolidation.
    *
    * Scopes work to changed files (or all files), clusters by subdirectory, and invokes an LLM
-   * to perform the requested maintenance operations.
+   * agent to perform the requested maintenance operations. Every change is versioned by the
+   * backend, so bad consolidation is reversible via `backend.rollback()`.
+   *
+   * @param config - Model, operations, and scope for this consolidation run
    */
-  async consolidate(_config: ConsolidateConfig): Promise<void> {
-    throw new Error('consolidation is not yet implemented')
+  async consolidate(config: ConsolidateConfig): Promise<void> {
+    const filePaths = await this._scopeFiles(config.scope)
+    if (filePaths.length === 0) {
+      logger.debug('scope=<empty> | no files to consolidate')
+      return
+    }
+
+    const clusters = this._clusterByDirectory(filePaths)
+
+    for (const [directory, paths] of Object.entries(clusters)) {
+      await this._consolidateCluster(directory, paths, config)
+    }
+
+    await this._recordConsolidation(config.operations)
   }
 
   private async _searchDirectory(
@@ -336,5 +353,203 @@ export class FileMemoryStore implements MemoryStore {
           .join('\n\n')
       },
     })
+  }
+
+  private async _scopeFiles(scope: 'since-last' | 'all'): Promise<string[]> {
+    if (scope === 'all') {
+      return this._collectAllFiles(KNOWLEDGE_PREFIX)
+    }
+
+    const lastTimestamp = await this._readLastConsolidationTimestamp()
+    const changes = await this._backend.changesSince(lastTimestamp)
+    const paths = new Set<string>()
+    for (const change of changes) {
+      if (change.path.startsWith(KNOWLEDGE_PREFIX + '/') && change.operation === 'write') {
+        paths.add(change.path)
+      }
+    }
+    return [...paths]
+  }
+
+  private async _collectAllFiles(prefix: string): Promise<string[]> {
+    const entries = await this._backend.list(prefix)
+    const files: string[] = []
+    for (const entry of entries) {
+      if (entry.isDirectory) {
+        files.push(...(await this._collectAllFiles(entry.path)))
+      } else {
+        files.push(entry.path)
+      }
+    }
+    return files
+  }
+
+  private _clusterByDirectory(paths: string[]): Record<string, string[]> {
+    const clusters: Record<string, string[]> = {}
+    for (const filePath of paths) {
+      const parts = filePath.split('/')
+      const dir = parts.slice(0, -1).join('/')
+      if (!clusters[dir]) clusters[dir] = []
+      clusters[dir]!.push(filePath)
+    }
+    return clusters
+  }
+
+  private async _consolidateCluster(
+    directory: string,
+    paths: string[],
+    config: ConsolidateConfig
+  ): Promise<void> {
+    const fileContents: string[] = []
+    for (const filePath of paths) {
+      try {
+        const content = await this._backend.read(filePath)
+        fileContents.push(`--- ${filePath} ---\n${content}`)
+      } catch {
+        // File may have been deleted between scope and execution
+      }
+    }
+
+    if (fileContents.length === 0) return
+
+    const systemPrompt = this._buildConsolidationPrompt(config.operations, directory)
+
+    const agent = new Agent({
+      model: config.model,
+      systemPrompt,
+      tools: [this._consolidationReadTool(), this._consolidationWriteTool(), this._consolidationDeleteTool()],
+      printer: false,
+    })
+
+    const userMessage = `Here are the knowledge files to process:\n\n${fileContents.join('\n\n')}`
+
+    await agent.invoke(userMessage)
+  }
+
+  private _buildConsolidationPrompt(operations: ConsolidationOperation[], directory: string): string {
+    const operationInstructions: Record<ConsolidationOperation, string> = {
+      deduplicate: 'Merge files that express the same fact into a single file. Remove the redundant one.',
+      'resolve-contradictions':
+        'When two files contradict each other, keep the more recent fact and delete the outdated one.',
+      'derive-insights':
+        'Combine related facts into higher-level patterns or summaries when multiple files share a theme.',
+      prune: 'Delete entries whose content is fully covered by a newer, more complete file.',
+      reorganize:
+        'Move files to more appropriate subdirectories based on content (e.g., skills/ for procedural knowledge, system/ for broadly relevant facts).',
+    }
+
+    const instructions = operations.map((op) => `- **${op}**: ${operationInstructions[op]}`).join('\n')
+
+    return [
+      'You are a memory consolidation agent. Your job is to improve the quality and organization of stored knowledge files.',
+      '',
+      `You are working on files in: ${directory}`,
+      '',
+      '## Operations to perform:',
+      instructions,
+      '',
+      '## Rules:',
+      '- Use the provided tools to read, write, and delete files.',
+      '- Preserve the markdown format with YAML frontmatter (description field).',
+      '- When merging files, update the description to reflect the combined content.',
+      '- When moving files (reorganize), write to the new path and delete the old one.',
+      '- Be conservative — only act when you are confident the operation improves quality.',
+      '- Process all provided files and report what you changed.',
+    ].join('\n')
+  }
+
+  private _consolidationReadTool(): Tool {
+    const backend = this._backend
+    return tool({
+      name: 'read_file',
+      description: 'Read a knowledge file by path.',
+      inputSchema: {
+        type: 'object',
+        properties: { path: { type: 'string', description: 'File path to read' } },
+        required: ['path'],
+      },
+      callback: async (input: unknown): Promise<JSONValue> => {
+        const { path } = input as { path: string }
+        try {
+          return await backend.read(path)
+        } catch {
+          return `Error: file not found: ${path}`
+        }
+      },
+    })
+  }
+
+  private _consolidationWriteTool(): Tool {
+    const backend = this._backend
+    return tool({
+      name: 'write_file',
+      description: 'Write or overwrite a knowledge file. Content should be markdown with YAML frontmatter.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'File path to write' },
+          content: { type: 'string', description: 'Full file content including frontmatter' },
+        },
+        required: ['path', 'content'],
+      },
+      callback: async (input: unknown): Promise<JSONValue> => {
+        const { path, content } = input as { path: string; content: string }
+        if (!path.startsWith(KNOWLEDGE_PREFIX + '/')) {
+          return 'Error: path must be under knowledge/'
+        }
+        await backend.write(path, content)
+        return `Written: ${path}`
+      },
+    })
+  }
+
+  private _consolidationDeleteTool(): Tool {
+    const backend = this._backend
+    return tool({
+      name: 'delete_file',
+      description: 'Delete a knowledge file.',
+      inputSchema: {
+        type: 'object',
+        properties: { path: { type: 'string', description: 'File path to delete' } },
+        required: ['path'],
+      },
+      callback: async (input: unknown): Promise<JSONValue> => {
+        const { path } = input as { path: string }
+        if (!path.startsWith(KNOWLEDGE_PREFIX + '/')) {
+          return 'Error: path must be under knowledge/'
+        }
+        await backend.delete(path)
+        return `Deleted: ${path}`
+      },
+    })
+  }
+
+  private async _readLastConsolidationTimestamp(): Promise<number> {
+    const changelogPath = `consolidation/changelog.md`
+    try {
+      const content = await this._backend.read(changelogPath)
+      const match = content.match(/^## (\d{4}-\d{2}-\d{2}T[\d:.]+Z)/m)
+      if (match?.[1]) {
+        return new Date(match[1]).getTime()
+      }
+    } catch {
+      // No changelog yet
+    }
+    return 0
+  }
+
+  private async _recordConsolidation(operations: ConsolidationOperation[]): Promise<void> {
+    const changelogPath = `consolidation/changelog.md`
+    const timestamp = new Date().toISOString()
+    const entry = `## ${timestamp}\n- Operations: ${operations.join(', ')}\n\n`
+
+    let existing = ''
+    try {
+      existing = await this._backend.read(changelogPath)
+    } catch {
+      // First consolidation
+    }
+
+    await this._backend.write(changelogPath, entry + existing)
   }
 }

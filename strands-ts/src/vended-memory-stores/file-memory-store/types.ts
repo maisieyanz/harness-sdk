@@ -5,6 +5,7 @@
  * and the configuration types for {@link FileMemoryStore} and {@link FileSessionStorage}.
  */
 
+import type { Model } from '../../models/model.js'
 import type { ExtractionConfig } from '../../memory/extraction/types.js'
 import type { MemoryStoreConfig } from '../../memory/types.js'
 
@@ -92,7 +93,7 @@ export type ConsolidationOperation =
  */
 export interface ConsolidateConfig {
   /** The model to use for consolidation reasoning. */
-  model: unknown
+  model: Model
   /** Which maintenance operations to run. */
   operations: ConsolidationOperation[]
   /** Whether to process all files or only those changed since the last run. */
