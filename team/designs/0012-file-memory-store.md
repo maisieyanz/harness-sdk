@@ -471,6 +471,12 @@ Score files using frontmatter metadata (tags, recency, access frequency) and loa
 
 ---
 
+## Security Model
+
+`FileMemoryStore` assumes single-tenant compute — one instance per user/agent. The `FileBackend` interface is identity-unaware; it takes a path and performs I/O without knowledge of who is asking. It is not a multi-tenancy boundary. Deployments serving multiple users must isolate at the container or credential layer (e.g., separate containers per tenant), not within a shared backend instance. Path validation in backends like `LocalFileBackend` is defense-in-depth against bugs, not an access control mechanism.
+
+---
+
 ## Willingness to Implement
 
 Yes.
