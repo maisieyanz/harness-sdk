@@ -719,3 +719,26 @@ Compare progressive disclosure (file tree + agent navigation) against embedding-
 Measure the relationship between consolidation frequency and token cost vs. retrieval quality. Research suggests diminishing returns — find the optimal cadence that preserves retrieval quality without excessive token usage.
 
 </details>
+
+<details>
+  <summary><b>Appendix G: Success Criteria</b></summary>
+
+### Required
+
+| Criterion | Measure |
+|-----------|---------|
+| SDK integration | A working `FileMemoryStore` that plugs into both `contextManager.storage` and `memoryManager.stores` — passing integration tests with the existing SDK |
+| Auditable history | `consolidation/changelog.md` and the backend's versioning journal tell a coherent story of what the agent learned and when — a developer can trace how memory evolved over time without inspecting individual file diffs |
+| Consolidation quality | Benchmark showing how consolidation changes retrieval quality (e.g., DMR recall before/after consolidation runs) |
+| Progressive disclosure efficiency | Benchmark measuring how progressive disclosure changes tokens loaded per turn and retrieval accuracy vs. full-context injection |
+| Inspectable and reversible | A developer can browse the memory directory, diff file changes over time via `backend.changesSince()`, and rollback bad writes via `backend.rollback()` — the versioning interface works end-to-end regardless of which `FileBackend` is used |
+
+### Nice to Have
+
+| Criterion | Measure |
+|-----------|---------|
+| CLI consolidation | A CLI entrypoint for running consolidation outside of an agent session (e.g., `npx strands-memory consolidate --path ./.agent-memory`) |
+| Comparative benchmarks | Benchmark comparison against managed alternatives (`BedrockKnowledgeBaseStore`) and in-memory baselines showing where a local file store adds value and where it doesn't |
+| End-to-end deployed example | A deployed Strands agent (code review, coding assistant, or similar) that uses `FileMemoryStore` for memory accumulation across sessions, with scheduled consolidation via GitHub Actions. Deployed for an internal team use case (e.g., a code review agent that remembers codebase patterns, or an onboarding agent that accumulates project knowledge) AND publishable as a labs/devtools sample demonstrating the full lifecycle: agent learns → memory accumulates → consolidation improves → agent gets better over time |
+
+</details>
