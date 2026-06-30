@@ -11,38 +11,33 @@
 
 ## Context
 
-LLM-powered agents struggle with maintaining and managing long-term memory effectively. As memory accumulates over extended interactions, memory quality degrades. In the Strands SDK, there is no built-in maintenance mechanism that can combine, deduplicate, resolve contradictions, or restructure isolated facts. Over long-horizon use, memory files accumulate redundancy and lose coherent structure, making retrieval less reliable and context windows less efficient.
+The Strands SDK has no local memory store. The existing store implementation, `BedrockKnowledgeBaseStore`, requires provisioned AWS infrastructure (Bedrock Knowledge Base, credentials, optional S3). This is well-suited for production and enterprise deployments where teams already have AWS infrastructure, but developers who want to prototype, run integration tests, or experiment with agent memory in non-production environments have no option that works without standing up a managed service. `FileMemoryStore` fills this gap: a local store that requires zero external infrastructure, just a filesystem.
 
-The existing `BedrockKnowledgeBaseStore` addresses retrieval via managed vector search, but requires provisioned AWS infrastructure (Bedrock Knowledge Base, credentials, optional S3). This is well-suited for production and enterprise deployments where teams already have AWS infrastructure. `FileMemoryStore` targets the other end: individual developers, prototyping, and environments where standing up a managed service is unnecessary overhead. It requires zero external infrastructure, just a filesystem.
+Separately, any long-lived memory system needs a maintenance mechanism. As memory accumulates over extended interactions, quality degrades — redundancy grows, contradictions go unresolved, and retrieval becomes less reliable. Managed stores like `BedrockKnowledgeBaseStore` handle this server-side — deduplication, indexing, and retrieval quality are responsibilities of the backend service. This works because the infrastructure runs outside the agent loop: it can process knowledge asynchronously, build embeddings, and serve semantic search without adding latency to agent sessions. A local store needs an equivalent offline step to prevent quality from degrading over time.
 
-Managed stores like `BedrockKnowledgeBaseStore` handle memory maintenance server-side — deduplication, indexing, and retrieval quality are responsibilities of the backend service. This works because the infrastructure runs outside the agent loop: it can process knowledge asynchronously, build embeddings, and serve semantic search without adding latency to agent sessions.
-
-There is no local equivalent. A developer who doesn't want managed infrastructure has no store implementation that maintains quality over time — facts accumulate, redundancy grows, and retrieval degrades. The gap is not in `MemoryManager` (which remains an orchestrator over its stores) but in the available store implementations: none provide offline maintenance without a server.
-
-`FileMemoryStore` fills this gap as a local alternative to managed stores. It organizes knowledge as a structured file hierarchy that the agent can navigate directly, and exposes an offline maintenance step (consolidation) that runs outside the agent loop — just as a managed backend would process knowledge asynchronously. By running offline, this step can do more than cleanup: it can also build local indexes, enabling semantic search without requiring a managed vector service. The storage layer is abstracted behind a `FileBackend` interface, so the same memory system can be backed by a local filesystem, a git repository, S3, or any other store that supports basic file operations.
+`FileMemoryStore` addresses both needs. It organizes knowledge as a structured file hierarchy that the agent can navigate directly, and exposes consolidation as an offline maintenance step — analogous to how managed backends process knowledge asynchronously. By running offline, this step can also build local indexes, enabling semantic search without a managed vector service.
 
 ---
 
 ## Decision
 
-This proposal introduces two constructs backed by a shared `FileBackend`:
+This proposal introduces **`FileMemoryStore`**, which implements the `MemoryStore` interface (for `MemoryManager`, L2). It handles knowledge: extracted facts, learned skills, progressive disclosure, search, and consolidation.
 
-- **`FileMemoryStore`** — implements the `MemoryStore` interface (for `MemoryManager`, L2). Handles knowledge: extracted facts, learned skills, progressive disclosure, search, and consolidation.
-- **`FileSessionStorage`** — implements the `Storage` interface (for `ContextOffloader`, L1). Handles session persistence: evicted content blocks, binary storage, retrieval by reference.
+For L1 (session persistence), the existing `FileStorage` from the context manager already implements the `Storage` interface and provides file operations (`read`, `write`, `list`, `delete`). It is passed directly to `ContextManager` — no additional wrapper class is needed.
 
-Both are separate classes with distinct responsibilities, but they share the same `FileBackend` instance and write to the same file hierarchy. This gives a unified, inspectable filesystem containing everything an agent has learned and experienced — without conflating L1 and L2 into a single construct.
+`FileMemoryStore` uses a `FileStorage` instance for its file operations.
 
-The storage backend is abstracted behind a `FileBackend` interface — any system that can read, write, list, and delete files can serve as the underlying store. This enables the same memory system to run against a local directory, a git repository, S3, or a custom implementation without changing the memory logic.
+Both L1 and L2 can share the same `FileStorage` instance pointed at the same root directory, giving a unified, inspectable filesystem containing everything an agent has learned and experienced — without conflating L1 and L2 into a single construct.
 
-The existing Strands API remains unchanged. L1 today is limited — content that leaves the active window has no general path to be retrieved back into context. By writing both layers to the same hierarchy, the `FileBackend` provides a unified substrate that future context retrieval capabilities can build on. `MemoryManager` still owns L1 --> L2 extraction. What changes is the physical storage: instead of separate, disconnected backends for each layer, both write to the same file hierarchy. Every write from either layer is routed through the `FileBackend`, which determines how persistence, history, and atomicity are handled.
+The existing Strands API remains unchanged. `MemoryManager` still owns L1 → L2 extraction. What changes is the physical storage: instead of separate, disconnected backends for each layer, both write to the same file hierarchy — `FileStorage` writes to `sessions/` for L1 and `FileMemoryStore` writes to `knowledge/` for L2.
 
 ### File Hierarchy
 
-`FileSessionStorage` and `FileMemoryStore` accept the same `FileBackend` instance at construction. This shared backend is what unifies the hierarchy — both write to a single root directory but are isolated by path: `FileSessionStorage` writes to `sessions/`, while `FileMemoryStore` writes to `knowledge/`. Consolidation metadata lives in `consolidation/`.
+`FileStorage` and `FileMemoryStore` can share the same root directory. They are isolated by path: `FileStorage` (via `ContextManager`) writes to `sessions/`, while `FileMemoryStore` writes to `knowledge/`. Consolidation metadata lives in `consolidation/`.
 
 ```
 agent_memory/
-├── sessions/                        # L1 - ContextOffloader writes here
+├── sessions/                        # L1 - ContextManager writes here
 │   ├── current.md
 │   └── history/
 │       ├── 2026-06-10-session-a.md
@@ -129,115 +124,15 @@ description: "How the user approaches testing: integration-first, mock at bounda
 
 ### Architecture
 
-#### FileBackend Interface
-
-The `FileBackend` interface defines the minimal set of file operations that any storage system must provide. `FileMemoryStore` passes relative paths (e.g., `knowledge/facts/testing.md`) — the backend joins them with its own `rootPath` (provided at construction) to form the full path. This keeps the store decoupled from where files physically live.
-
-```typescript
-interface FileBackend {
-  read(path: string): Promise<string>;
-  write(path: string, content: string): Promise<void>;
-  delete(path: string): Promise<void>;
-  list(prefix?: string): Promise<FileEntry[]>;
-  exists(path: string): Promise<boolean>;
-
-  // Versioning — each backend implements with its native mechanism
-  changesSince(timestamp: number): Promise<FileChange[]>;
-  rollback(path: string, timestamp: number): Promise<void>;
-}
-
-interface FileEntry {
-  path: string;
-  isDirectory: boolean;
-}
-
-interface FileChange {
-  path: string;
-  timestamp: number;
-  operation: "write" | "delete";
-}
-```
-
-**`changesSince(timestamp)`** returns all writes and deletes that occurred after the given timestamp. Consolidation uses this to scope work (`"since-last"`) and to provide recency context to the agent. **`rollback(path, timestamp)`** restores a file to its state at the given timestamp — used to undo bad consolidation.
-
-#### How the Components Connect
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│ Agent                                                            │
-│                                                                  │
-│  ┌──────────────────┐          ┌────────────────────────┐        │
-│  │ ContextOffloader │          │ MemoryManager          │        │
-│  │ (plugin)         │          │ (orchestrator)         │        │
-│  └────────┬─────────┘          └───────────┬────────────┘        │
-│           │ store()/retrieve()             │ search()/add()      │
-│           ▼                                ▼                     │
-│  ┌───────────────────┐          ┌────────────────────────┐       │
-│  │ FileSessionStorage│          │ FileMemoryStore        │       │
-│  │ implements Storage│          │ implements MemoryStore │       │
-│  └────────┬──────────┘          └───────────┬────────────┘       │
-│           │                                 │                    │
-│           │         ┌───────────┐           │                    │
-│           └────────►│FileBackend│◄──────────┘                    │
-│                     │(shared)   │                                │
-│                     └─────┬─────┘                                │
-│                           │                                      │
-└───────────────────────────┼──────────────────────────────────────┘
-                            ▼
-                   .agent-memory/
-                   ├── sessions/
-                   └── knowledge/
-```
-
-#### Example: LocalFileBackend
-
-```typescript
-class LocalFileBackend implements FileBackend {
-  private rootPath: string;
-
-  constructor({ rootPath }: { rootPath: string }) {
-    this.rootPath = rootPath;
-  }
-
-  // File operations — each joins this.rootPath with the relative path
-  async read(path: string): Promise<string> {}
-  async write(path: string, content: string): Promise<void> {}
-  async delete(path: string): Promise<void> {}
-  async list(prefix?: string): Promise<FileEntry[]> {}
-  async exists(path: string): Promise<boolean> {}
-
-  // Versioning — implemented via .versions/ snapshots and .journal
-  async changesSince(timestamp: number): Promise<FileChange[]> {}
-  async rollback(path: string, timestamp: number): Promise<void> {}
-}
-```
-
-#### FileSessionStorage
-
-`FileSessionStorage` implements the `Storage` interface (called by the `ContextOffloader`). It handles L1 persistence — storing evicted content blocks as files under `sessions/` and retrieving them by reference.
-
-```typescript
-interface FileSessionStorageConfig {
-  backend: FileBackend;
-}
-
-class FileSessionStorage implements Storage {
-  constructor(config: FileSessionStorageConfig)
-
-  async store(key: string, content: Uint8Array, contentType?: string): Promise<string>
-  async retrieve(reference: string): Promise<{ content: Uint8Array; contentType: string }>
-}
-```
-
 #### FileMemoryStore
 
-`FileMemoryStore` implements the `MemoryStore` interface (called by `MemoryManager`). It handles L2 — knowledge storage, progressive disclosure, search, and consolidation. It operates on `knowledge/` through whichever `FileBackend` is provided.
+`FileMemoryStore` implements the `MemoryStore` interface (called by `MemoryManager`). It handles L2 — knowledge storage, progressive disclosure, search, and consolidation. It operates on `knowledge/` through a `FileStorage` instance for file operations.
 
 ```typescript
 interface FileMemoryStoreConfig {
   // Required
   name: string;
-  backend: FileBackend;
+  storage: FileStorage;
 
   // Optional (MemoryStore interface)
   description?: string;
@@ -268,16 +163,6 @@ class FileMemoryStore implements MemoryStore {
 
 ### Method Behavior
 
-#### FileSessionStorage
-
-**`store(key, content, contentType?)`**
-
-Called by the context offloader when content is evicted from the context window. The `key` is a unique identifier for the content block (provided by the offloader), and `contentType` is the MIME type (e.g., `text/plain`, `image/png`). Writes the content as a file to `sessions/` and returns the file path as a reference string.
-
-**`retrieve(reference)`**
-
-Takes the reference string returned by `store()` and reads the file back. Returns the content and its content type. Called when the agent needs previously evicted content back in the context window.
-
 #### FileMemoryStore
 
 **`add(content, metadata?)`**
@@ -304,52 +189,36 @@ During `consolidate()`, an embedding model computes vectors for each knowledge f
 
 With semantic search in place, `FileMemoryStore` works through the existing `MemoryManager` retrieval mechanisms (injection and `search_memory`) without depending on the agent's judgment to navigate files. The tradeoff: progressive disclosure costs tokens every turn (file tree in system prompt + tool calls for navigation), while semantic search costs tokens only during offline consolidation and is free at runtime.
 
-### Versioning
-
-Versioning is a backend responsibility — each backend implements `changesSince()` and `rollback()` using whatever mechanism is native to its storage:
-
-| Backend | How it versions |
-|---------|----------------|
-| `GitFileBackend` | `git log`, `git show`, `git revert` — free, built into the storage |
-| `LocalFileBackend` | Copies previous content to `.versions/{path}/{timestamp}` before overwriting; maintains a `.journal` file for `changesSince()` |
-| `S3FileBackend` | S3 object versioning — managed by the service |
-
-`FileMemoryStore` doesn't implement versioning itself — it calls `this.backend.rollback()` or `this.backend.changesSince()` and lets the backend decide how. This avoids redundant work for backends that already version natively (git, S3) while still supporting backends that don't (local filesystem).
-
-
 ### Integration with Existing Features
 
-L1 and L2 are separate constructs backed by the same `FileBackend`:
+L1 and L2 share the same `FileStorage` instance:
 
 ```typescript
 import { Agent, MemoryManager } from "@strands-agents/sdk";
-import { ContextOffloader } from "@strands-agents/sdk/vended-plugins/context-offloader";
-import { FileMemoryStore, FileSessionStorage, LocalFileBackend } from "@strands-agents/sdk/memory";
+import { ContextManager } from "@strands-agents/sdk/context";
+import { FileStorage } from "@strands-agents/sdk/storage";
+import { FileMemoryStore } from "@strands-agents/sdk/memory";
 
-const backend = new LocalFileBackend({ rootPath: "./.agent-memory" });
-
-const sessionStorage = new FileSessionStorage({ backend });  // L1
-const memoryStore = new FileMemoryStore({                     // L2
+const fileStorage = new FileStorage({ rootPath: "./.agent-memory" });
+const memoryStore = new FileMemoryStore({
     name: "agent-memory",
-    backend,
+    storage: fileStorage,
 });
 
 const agent = new Agent({
     model,
-    plugins: [new ContextOffloader({ storage: sessionStorage })],
+    contextManager: new ContextManager({ storage: fileStorage }),
     memoryManager: new MemoryManager({
         stores: [memoryStore],
     }),
 });
 ```
 
-Custom backends implement the `FileBackend` interface. See [Appendix C](#appendix-c-git-based-memory) for an example git-based implementation.
-
 ---
 
 ## Consolidation
 
-Consolidation improves memory quality after facts accumulate. It is a developer-invoked Strands agent exposed as a method on `FileMemoryStore`. It reads stored knowledge, reasons across files, and writes changes through the `FileBackend`. Every change is versioned by the backend (via `history()`/`rollback()`), so bad consolidation is trivially reversible.
+Consolidation improves memory quality after facts accumulate. It is a developer-invoked Strands agent exposed as a method on `FileMemoryStore`. It reads stored knowledge, reasons across files, and writes changes through `FileStorage`.
 
 All extracted facts land in `knowledge/facts/` by default — `FileMemoryStore.add()` writes there unconditionally for simplicity and to avoid a classification model call on every extraction. Consolidation is therefore responsible for reorganizing files into appropriate subdirectories (`skills/`, `system/`, etc.) during offline maintenance, when it has full cross-file context to make informed categorization decisions.
 
@@ -360,7 +229,7 @@ myStore.consolidate(config)
 │
 ├─ 1. SCOPE: determine which files to process
 │     scope: "since-last" → read last consolidation timestamp from changelog.md,
-│                            then call backend.changesSince(timestamp) to get modified files
+│                            then list files modified after that timestamp (via mtime)
 │     scope: "all"        → everything in knowledge/
 │
 ├─ 2. CLUSTER: group eligible files by subdirectory
@@ -375,12 +244,11 @@ myStore.consolidate(config)
 │     Each agent invocation receives:
 │     - model:         the LLM passed in config (does the reasoning)
 │     - system prompt: built from config.operations (e.g. "deduplicate", "prune")
-│     - tools:         readFile, writeFile, deleteFile (thin wrappers around this.backend)
-│     - context:       the FileChange[] entries for this cluster (from step 1), providing
-│                      timestamps so the agent can reason about recency
+│     - tools:         readFile, writeFile, deleteFile (thin wrappers around FileStorage)
+│     - context:       the list of modified files for this cluster (from step 1)
 │
 │     The agent reads the cluster's files, applies the requested operations, and writes
-│     changes back through the FileBackend.
+│     changes back through FileStorage.
 │
 └─ 4. RECORD: append timestamp + summary to consolidation/changelog.md
        This serves as both an audit log and the cursor for the next "since-last" run.
@@ -454,20 +322,24 @@ Score files using frontmatter metadata (tags, recency, access frequency) and loa
 
 - No ongoing infrastructure costs for storage and retrieval — everything runs locally. Only LLM calls (extraction, consolidation) cost tokens, and those are controlled by the developer.
 - Cross-session knowledge with zero external infrastructure (no vector DB, no managed service)
-- Backend-agnostic — swap between local filesystem, git, S3, or custom implementations without changing the memory logic
-- Full audit trail — versioned history with rollback support
 - Developer debugging — inspect the file hierarchy directly; changes are diffable
 - Portability — memory directory can be copied, shared, or used to seed other agents with a knowledge base
 
 ### What Becomes Harder
 
-- Scaling beyond ~1,000 knowledge files — file listing and search may slow down with very large trees (backend-dependent)
+- Scaling beyond ~1,000 knowledge files — file listing and search may slow down with very large trees
 - Concurrent writes from multiple agent instances — simultaneous writes require coordination (file locking or single-writer constraint)
 - Retrieval quality depends on model judgment — the agent must recognize when to search and what to read; if it doesn't look, relevant memories stay hidden
-- Consolidation cost and non-determinism — each run calls a model, costs tokens, and may produce different results on re-runs (mitigated by every change being versioned and reversible)
+- Consolidation cost and non-determinism — each run calls a model, costs tokens, and may produce different results on re-runs
 - Storage growth — sessions accumulate indefinitely; may need a retention policy for old session files
 
 
+
+---
+
+## Security Model
+
+`FileMemoryStore` assumes single-tenant compute — one instance per user/agent. `FileStorage` is identity-unaware; it takes a path and performs I/O without knowledge of who is asking. It is not a multi-tenancy boundary. Deployments serving multiple users must isolate at the container or credential layer (e.g., separate containers per tenant), not within a shared `FileStorage` instance. Path validation is defense-in-depth against bugs, not an access control mechanism.
 
 ---
 
@@ -518,7 +390,7 @@ Agent calls: search_memory("retry failed requests")
 ```typescript
 const myStore = new FileMemoryStore({
   name: "agent-memory",
-  backend: new LocalFileBackend({ rootPath: "./.agent-memory" }),
+  storage: new FileStorage({ rootPath: "./.agent-memory" }),
   extraction: {
     triggers: [new InvocationTrigger()],
     extractor: new ModelExtractor({
@@ -535,17 +407,40 @@ const myStore = new FileMemoryStore({
 </details>
 
 <details>
-  <summary><b>Appendix C: Git-Based Memory (Original Design)</b></summary>
+  <summary><b>Appendix C: FileBackend — Versioning and Rollback (Nice to Have)</b></summary>
 
-The original design for this proposal was a `GitMemoryStore` — a single class backed directly by a git repository. Every write produced a git commit, rollback was `git revert`, and the full audit trail lived in `git log`. Consolidation used git worktrees for concurrent operations and `git diff` for developer debugging.
+The core `FileMemoryStore` operates on `FileStorage` alone — no versioning required. For developers who want rollback support and richer change tracking (e.g., undoing bad consolidation), a `FileBackend` interface can be layered on top. This is a nice-to-have extension, not a requirement for the initial implementation.
 
-The `FileBackend` abstraction was introduced instead so that the file-based memory model (hierarchy, progressive disclosure, consolidation) remains unchanged while the underlying storage can vary. 
+Beyond versioning, `FileBackend` is also the path to supporting different storage backends (git, S3, etc.). Since `FileMemoryStore` is bound to `FileStorage` (a concrete local filesystem class), `FileBackend` serves as the abstraction layer where backend-specific behavior plugs in — allowing the memory system to expand beyond local-only storage without changing the core `FileMemoryStore` interface.
 
-We can still implement a git-based backend using the FileBackend abstraction:
+The `FileBackend` interface defines versioning operations independently of file operations:
 
 ```typescript
-import fs from "node:fs/promises";
+interface FileBackend {
+  changesSince(timestamp: number): Promise<FileChange[]>;
+  rollback(path: string, timestamp: number): Promise<void>;
+}
 
+interface FileChange {
+  path: string;
+  timestamp: number;
+  operation: "write" | "delete";
+}
+```
+
+**`changesSince(timestamp)`** returns all writes and deletes after the given timestamp — used by consolidation for precise `"since-last"` scoping. **`rollback(path, timestamp)`** restores a file to its state at the given timestamp — used to undo bad consolidation.
+
+| Backend | How it versions |
+|---------|----------------|
+| `LocalFileBackend` | Copies previous content to `.versions/{path}/{timestamp}` before overwriting; maintains a `.journal` file for `changesSince()` |
+| `GitFileBackend` | `git log`, `git show`, `git revert` — free, built into the storage |
+| `S3FileBackend` | S3 object versioning — managed by the service |
+
+### Git-Based Example
+
+A git-based versioning backend:
+
+```typescript
 class GitFileBackend implements FileBackend {
   private rootPath: string;
 
@@ -553,61 +448,46 @@ class GitFileBackend implements FileBackend {
     this.rootPath = rootPath;
   }
 
-  async read(path: string) { /* fs.readFile at rootPath/path */ }
-  async write(path: string, content: string) { /* fs.writeFile, then git add + git commit */ }
-  async delete(path: string) { /* fs.rm, then git add + git commit */ }
-  async list(prefix?: string) { /* fs.readdir at rootPath/prefix */ }
-  async exists(path: string) { /* fs.access at rootPath/path */ }
+  async changesSince(timestamp: number) { /* git log --since */ }
+  async rollback(path: string, timestamp: number) { /* git show <commit>:<path> + write */ }
 }
 ```
 
 ### Call Flow
 
-When the agent extracts a fact, `FileMemoryStore.add()` calls `this.backend.write()` (the store doesn't know which backend — it calls the interface method, which resolves to whichever instance was passed in):
+When the agent extracts a fact, `FileMemoryStore.add()` writes through its `FileStorage` instance:
 
 ```
 agent extracts "user prefers dark mode"
   → FileMemoryStore.add(content, { title: "dark-mode" })
-    → GitFileBackend.write("knowledge/facts/dark-mode.md", content)
+    → FileStorage.write("knowledge/facts/dark-mode.md", content)
       → fs.writeFile(".agent-memory/knowledge/facts/dark-mode.md", content)
-      → git add knowledge/facts/dark-mode.md
-      → git commit -m "memory(facts): update dark-mode.md"
 ```
 
-When the context offloader evicts content:
-
-```
-ContextOffloader evicts a session block
-  → FileSessionStorage.store(key, content)
-    → GitFileBackend.write("sessions/current.md", content)
-      → fs.writeFile + git add + git commit
-```
-
-When consolidation runs:
+When consolidation runs with `scope: "since-last"`, it calls `GitFileBackend.changesSince()` to determine which files to process, then reads/writes through `FileStorage`:
 
 ```
 myStore.consolidate({ model, operations: ["deduplicate"], scope: "since-last" })
-  → consolidation agent calls FileMemoryStore methods
-    → each write/delete routes through GitFileBackend
-      → individual commits per operation
-         a3f2c1d memory(facts): merge dark-mode.md into editor-preferences.md
-         b7e4a2f memory(facts): delete dark-mode.md
+  → GitFileBackend.changesSince(lastTimestamp) → git log --since
+  → consolidation agent reads files via FileStorage
+  → consolidation agent writes merged/pruned files via FileStorage
 ```
 
 ### Usage
 
 ```typescript
-const backend = new GitFileBackend({ rootPath: "./.agent-memory" });
+const fileStorage = new FileStorage({ rootPath: "./.agent-memory" });
+const gitBackend = new GitFileBackend({ rootPath: "./.agent-memory" });
 
-const sessionStorage = new FileSessionStorage({ backend });
 const memoryStore = new FileMemoryStore({
     name: "agent-memory",
-    backend,
+    storage: fileStorage,
+    backend: gitBackend,
 });
 
 const agent = new Agent({
     model,
-    plugins: [new ContextOffloader({ storage: sessionStorage })],
+    contextManager: new ContextManager({ storage: fileStorage }),
     memoryManager: new MemoryManager({ stores: [memoryStore] }),
 });
 ```
@@ -616,18 +496,18 @@ The developer gets `git log`, `git diff`, and `git revert` for free — same mem
 
 ### Versioning Interface in Practice
 
-The versioning methods on `FileBackend` are called by `FileMemoryStore` during consolidation and rollback. Here's how they're used with the git backend:
+The versioning methods on `FileBackend` are called by `FileMemoryStore` during consolidation and rollback:
 
 ```typescript
-const backend = new GitFileBackend({ rootPath: "./.agent-memory" });
+const gitBackend = new GitFileBackend({ rootPath: "./.agent-memory" });
 
 // Scoping: get all files that changed since a timestamp (used by consolidation "since-last")
-const changes = await backend.changesSince(1718234000);
+const changes = await gitBackend.changesSince(1718234000);
 // → [{ path: "knowledge/facts/dark-mode.md", timestamp: 1718234500, operation: "write" },
 //    { path: "knowledge/facts/old-process.md", timestamp: 1718300000, operation: "delete" }]
 
 // Rollback: restore a file to its state at a prior timestamp (used to undo bad consolidation)
-await backend.rollback("knowledge/facts/editor-preferences.md", 1718234000);
+await gitBackend.rollback("knowledge/facts/editor-preferences.md", 1718234000);
 ```
 
 For `GitFileBackend`, `changesSince()` maps to `git log --since` and `rollback()` maps to `git show <commit>:<path>` + write. For `LocalFileBackend`, these use the `.journal` file and `.versions/` snapshots respectively.
@@ -641,11 +521,12 @@ For `GitFileBackend`, `changesSince()` maps to `git log --since` and `rollback()
 
 ```typescript
 // consolidate.ts — run via cron, GitHub Action, or manually
-import { FileMemoryStore, LocalFileBackend } from "@strands-agents/sdk/memory";
+import { FileMemoryStore } from "@strands-agents/sdk/memory";
+import { FileStorage } from "@strands-agents/sdk/storage";
 
 const myStore = new FileMemoryStore({
   name: "agent-memory",
-  backend: new LocalFileBackend({ rootPath: "./.agent-memory" }),
+  storage: new FileStorage({ rootPath: "./.agent-memory" }),
 });
 
 // Nightly incremental (cheap — only processes new files)
@@ -717,5 +598,29 @@ Compare progressive disclosure (file tree + agent navigation) against embedding-
 ### Consolidation Frequency
 
 Measure the relationship between consolidation frequency and token cost vs. retrieval quality. Research suggests diminishing returns — find the optimal cadence that preserves retrieval quality without excessive token usage.
+
+</details>
+
+<details>
+  <summary><b>Appendix G: Success Criteria</b></summary>
+
+### Required
+
+| Criterion | Measure |
+|-----------|---------|
+| SDK integration | A working `FileMemoryStore` that plugs into both `contextManager.storage` and `memoryManager.stores` — passing integration tests with the existing SDK |
+| Auditable history | `consolidation/changelog.md` tells a coherent story of what the agent learned and when — a developer can trace how memory evolved over time without inspecting individual file diffs |
+| Consolidation quality | Benchmark showing how consolidation changes retrieval quality (e.g., DMR recall before/after consolidation runs) |
+| Progressive disclosure efficiency | Benchmark measuring how progressive disclosure changes tokens loaded per turn and retrieval accuracy vs. full-context injection |
+| Inspectable | A developer can browse the memory directory and diff file changes directly — the file hierarchy is human-readable and diffable |
+
+### Nice to Have
+
+| Criterion | Measure |
+|-----------|---------|
+| CLI consolidation | A CLI entrypoint for running consolidation outside of an agent session (e.g., `npx strands-memory consolidate --path ./.agent-memory`) |
+| FileBackend versioning | A `FileBackend` interface providing `changesSince()` and `rollback()` for precise change tracking and undo support — see [Appendix C](#appendix-c-filebackend--versioning-and-rollback-nice-to-have) |
+| Comparative benchmarks | Benchmark comparison against managed alternatives (`BedrockKnowledgeBaseStore`) and in-memory baselines showing where a local file store adds value and where it doesn't |
+| End-to-end deployed example | A deployed Strands agent (code review, coding assistant, or similar) that uses `FileMemoryStore` for memory accumulation across sessions, with scheduled consolidation via GitHub Actions. Deployed for an internal team use case (e.g., a code review agent that remembers codebase patterns, or an onboarding agent that accumulates project knowledge) AND publishable as a labs/devtools sample demonstrating the full lifecycle: agent learns → memory accumulates → consolidation improves → agent gets better over time |
 
 </details>
