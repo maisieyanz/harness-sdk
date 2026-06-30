@@ -1,15 +1,10 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { FileMemoryStore } from '../file-memory-store.js'
 import type { InvokableTool } from '../../../tools/tool.js'
-import type { FileBackend, FileChange, FileEntry } from '../types.js'
+import type { FileStorage, FileEntry } from '../types.js'
 
-/**
- * In-memory implementation of FileBackend for testing FileMemoryStore
- * without touching the real filesystem.
- */
-class InMemoryBackend implements FileBackend {
+class InMemoryStorage implements FileStorage {
   private _files = new Map<string, { content: string; timestamp: number }>()
-  private _changes: FileChange[] = []
 
   async read(path: string): Promise<string> {
     const entry = this._files.get(path)
@@ -18,21 +13,18 @@ class InMemoryBackend implements FileBackend {
   }
 
   async write(path: string, content: string): Promise<void> {
-    const timestamp = Date.now()
-    this._files.set(path, { content, timestamp })
-    this._changes.push({ path, timestamp, operation: 'write' })
+    this._files.set(path, { content, timestamp: Date.now() })
   }
 
   async delete(path: string): Promise<void> {
     this._files.delete(path)
-    this._changes.push({ path, timestamp: Date.now(), operation: 'delete' })
   }
 
   async list(prefix?: string): Promise<FileEntry[]> {
     const entries: FileEntry[] = []
     const seen = new Set<string>()
 
-    for (const filePath of this._files.keys()) {
+    for (const [filePath, file] of this._files.entries()) {
       const target = prefix ? prefix + '/' : ''
       if (!filePath.startsWith(target)) continue
 
@@ -40,7 +32,7 @@ class InMemoryBackend implements FileBackend {
       const slashIdx = remainder.indexOf('/')
 
       if (slashIdx === -1) {
-        entries.push({ path: filePath, isDirectory: false })
+        entries.push({ path: filePath, isDirectory: false, mtime: file.timestamp })
       } else {
         const dirPath = prefix ? `${prefix}/${remainder.slice(0, slashIdx)}` : remainder.slice(0, slashIdx)
         if (!seen.has(dirPath)) {
@@ -52,42 +44,31 @@ class InMemoryBackend implements FileBackend {
     return entries
   }
 
-  async exists(path: string): Promise<boolean> {
-    return this._files.has(path)
-  }
-
-  async changesSince(timestamp: number): Promise<FileChange[]> {
-    return this._changes.filter((c) => c.timestamp > timestamp)
-  }
-
-  async rollback(_path: string, _timestamp: number): Promise<void> {
-    throw new Error('not implemented in test backend')
-  }
 }
 
 describe('FileMemoryStore', () => {
-  let backend: InMemoryBackend
+  let storage: InMemoryStorage
   let store: FileMemoryStore
 
   beforeEach(() => {
-    backend = new InMemoryBackend()
+    storage = new InMemoryStorage()
     store = new FileMemoryStore({
       name: 'test-store',
       description: 'A test file memory store',
-      backend,
+      storage,
     })
   })
 
   describe('add', () => {
     it('writes a markdown file to knowledge/facts/', async () => {
       await store.add('User prefers dark mode', { title: 'dark-mode', description: 'Theme preference' })
-      const exists = await backend.exists('knowledge/facts/dark-mode.md')
-      expect(exists).toBe(true)
+      const content = await storage.read('knowledge/facts/dark-mode.md')
+      expect(content).toContain('dark mode')
     })
 
     it('includes frontmatter with description', async () => {
       await store.add('Prefers integration tests', { title: 'testing', description: 'Testing approach' })
-      const content = await backend.read('knowledge/facts/testing.md')
+      const content = await storage.read('knowledge/facts/testing.md')
       expect(content).toContain('---')
       expect(content).toContain('description: "Testing approach"')
       expect(content).toContain('Prefers integration tests')
@@ -95,15 +76,15 @@ describe('FileMemoryStore', () => {
 
     it('derives filename from content when no title provided', async () => {
       await store.add('The user likes vim keybindings')
-      const entries = await backend.list('knowledge/facts')
+      const entries = await storage.list('knowledge/facts')
       expect(entries.length).toBe(1)
       expect(entries[0]!.path).toMatch(/knowledge\/facts\/.*\.md$/)
     })
 
     it('derives description from first sentence when not provided', async () => {
       await store.add('Always use strict mode. It prevents bugs.')
-      const entries = await backend.list('knowledge/facts')
-      const content = await backend.read(entries[0]!.path)
+      const entries = await storage.list('knowledge/facts')
+      const content = await storage.read(entries[0]!.path)
       expect(content).toContain('description: "Always use strict mode')
     })
   })
@@ -142,7 +123,7 @@ describe('FileMemoryStore', () => {
     })
 
     it('excludes system files from results', async () => {
-      await backend.write(
+      await storage.write(
         'knowledge/system/prefs.md',
         '---\ndescription: "User prefs"\n---\n\ndark mode everywhere'
       )
@@ -212,7 +193,7 @@ describe('FileMemoryStore', () => {
 
   describe('renderFileTree', () => {
     beforeEach(async () => {
-      await backend.write('knowledge/system/prefs.md', '---\ndescription: "Core preferences"\n---\n\nvim mode')
+      await storage.write('knowledge/system/prefs.md', '---\ndescription: "Core preferences"\n---\n\nvim mode')
       await store.add('Testing approach', { title: 'testing', description: 'Integration-first' })
     })
 
@@ -232,8 +213,8 @@ describe('FileMemoryStore', () => {
 
   describe('loadSystemKnowledge', () => {
     it('returns concatenated content of all system files', async () => {
-      await backend.write('knowledge/system/a.md', '---\ndescription: "A"\n---\n\nContent A')
-      await backend.write('knowledge/system/b.md', '---\ndescription: "B"\n---\n\nContent B')
+      await storage.write('knowledge/system/a.md', '---\ndescription: "A"\n---\n\nContent A')
+      await storage.write('knowledge/system/b.md', '---\ndescription: "B"\n---\n\nContent B')
       const result = await store.loadSystemKnowledge()
       expect(result).toContain('Content A')
       expect(result).toContain('Content B')

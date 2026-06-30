@@ -1,9 +1,9 @@
 /**
  * File-based memory store implementing the {@link MemoryStore} interface.
  *
- * Organizes knowledge as a structured file hierarchy under `knowledge/` in the shared
- * {@link FileBackend}. Provides progressive disclosure (file tree in system prompt + navigation
- * tools), keyword-based search, and offline consolidation.
+ * Organizes knowledge as a structured file hierarchy under `knowledge/`. Provides progressive
+ * disclosure (file tree in system prompt + navigation tools), keyword-based search, and offline
+ * consolidation via an agent-based maintenance step.
  */
 
 import type { JSONValue } from '../../types/json.js'
@@ -11,7 +11,7 @@ import type { MemoryEntry, MemoryStore, SearchOptions } from '../../memory/types
 import type { ExtractionConfig } from '../../memory/extraction/types.js'
 import type { Tool } from '../../tools/tool.js'
 import type { Plugin } from '../../plugins/plugin.js'
-import type { FileBackend, FileMemoryStoreConfig, ConsolidateConfig, ConsolidationOperation } from './types.js'
+import type { FileStorage, FileMemoryStoreConfig, ConsolidateConfig, ConsolidationOperation } from './types.js'
 import { Agent } from '../../agent/agent.js'
 import { ContextInjector } from '../../vended-plugins/context-injector/plugin.js'
 import { tool } from '../../tools/tool-factory.js'
@@ -21,9 +21,6 @@ const KNOWLEDGE_PREFIX = 'knowledge'
 const SYSTEM_PREFIX = `${KNOWLEDGE_PREFIX}/system`
 const FACTS_PREFIX = `${KNOWLEDGE_PREFIX}/facts`
 
-/**
- * Parses YAML frontmatter from a markdown file, extracting the `description` field.
- */
 function parseFrontmatter(content: string): { description: string; body: string } {
   const match = content.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/)
   if (!match) return { description: '', body: content }
@@ -35,9 +32,6 @@ function parseFrontmatter(content: string): { description: string; body: string 
   return { description: descMatch?.[1] ?? '', body }
 }
 
-/**
- * Generates a slug from text for use as a filename.
- */
 function slugify(text: string): string {
   return text
     .toLowerCase()
@@ -64,17 +58,19 @@ export class FileMemoryStore implements MemoryStore {
   readonly maxSearchResults?: number
   readonly extraction?: boolean | ExtractionConfig
 
-  private readonly _backend: FileBackend
-  private readonly _maxTokens: number
+  private readonly _storage: FileStorage
 
   constructor(config: FileMemoryStoreConfig) {
     this.name = config.name
     if (config.description !== undefined) this.description = config.description
     if (config.maxSearchResults !== undefined) this.maxSearchResults = config.maxSearchResults
     if (config.extraction !== undefined) this.extraction = config.extraction
-    this._backend = config.backend
-    this._maxTokens = config.retrieval?.maxTokens ?? 2000
+    this._storage = config.storage
   }
+
+  // ---------------------------------------------------------------------------
+  // MemoryStore interface
+  // ---------------------------------------------------------------------------
 
   /**
    * Search knowledge files by keyword matching against filenames, descriptions, and content.
@@ -109,26 +105,23 @@ export class FileMemoryStore implements MemoryStore {
     const path = `${FACTS_PREFIX}/${filename}`
 
     const fileContent = `---\ndescription: "${description.replace(/"/g, '\\"')}"\n---\n\n${content}\n`
-    await this._backend.write(path, fileContent)
+    await this._storage.write(path, fileContent)
   }
 
   /**
    * Returns tools for progressive disclosure: `read_memory_file` and `grep_memory`.
-   *
-   * These let the agent navigate the knowledge hierarchy directly — reading specific files
-   * or searching across file content.
    */
   getTools(): Tool[] {
     return [this._readFileTool(), this._grepTool()]
   }
 
+  // ---------------------------------------------------------------------------
+  // Progressive disclosure
+  // ---------------------------------------------------------------------------
+
   /**
    * Returns a {@link ContextInjector} plugin that injects the knowledge file tree and system
-   * knowledge into the model's context every user turn.
-   *
-   * Register this as a plugin on the agent alongside the {@link MemoryManager}. When using
-   * progressive disclosure, disable the MemoryManager's built-in injection (`injection: false`)
-   * and use this injector instead — the agent sees the file tree and navigates with tools.
+   * knowledge into the model's context every turn.
    *
    * @returns A plugin that injects the file tree and system knowledge into the model context
    */
@@ -157,10 +150,7 @@ export class FileMemoryStore implements MemoryStore {
   }
 
   /**
-   * Renders the knowledge file tree for injection into the system prompt.
-   *
-   * Lists all files under `knowledge/` with their descriptions. Files in `system/` are marked
-   * as always-loaded; others show filename + description only.
+   * Renders the knowledge file tree with descriptions for system prompt injection.
    */
   async renderFileTree(): Promise<string> {
     const lines: string[] = ['knowledge/']
@@ -169,27 +159,31 @@ export class FileMemoryStore implements MemoryStore {
   }
 
   /**
-   * Returns the full content of all files in `knowledge/system/` for injection.
+   * Returns the full content of all files in `knowledge/system/`.
    */
   async loadSystemKnowledge(): Promise<string> {
-    const entries = await this._backend.list(SYSTEM_PREFIX)
+    const entries = await this._storage.list(SYSTEM_PREFIX)
     const parts: string[] = []
 
     for (const entry of entries) {
       if (entry.isDirectory) continue
-      const content = await this._backend.read(entry.path)
+      const content = await this._storage.read(entry.path)
       parts.push(content)
     }
 
     return parts.join('\n\n---\n\n')
   }
 
+  // ---------------------------------------------------------------------------
+  // Consolidation
+  // ---------------------------------------------------------------------------
+
   /**
    * Run offline consolidation.
    *
-   * Scopes work to changed files (or all files), clusters by subdirectory, and invokes an LLM
-   * agent to perform the requested maintenance operations. Every change is versioned by the
-   * backend, so bad consolidation is reversible via `backend.rollback()`.
+   * Scopes work to changed files (via mtime) or all files, clusters by subdirectory, and
+   * invokes an LLM agent to perform the requested maintenance operations. Records each run
+   * in `consolidation/changelog.md`.
    *
    * @param config - Model, operations, and scope for this consolidation run
    */
@@ -209,12 +203,16 @@ export class FileMemoryStore implements MemoryStore {
     await this._recordConsolidation(config.operations)
   }
 
+  // ---------------------------------------------------------------------------
+  // Private — search
+  // ---------------------------------------------------------------------------
+
   private async _searchDirectory(
     prefix: string,
     terms: string[],
     results: Array<{ entry: MemoryEntry; score: number }>
   ): Promise<void> {
-    const entries = await this._backend.list(prefix)
+    const entries = await this._storage.list(prefix)
 
     for (const entry of entries) {
       if (entry.isDirectory) {
@@ -224,7 +222,7 @@ export class FileMemoryStore implements MemoryStore {
 
       if (entry.path.startsWith(SYSTEM_PREFIX)) continue
 
-      const content = await this._backend.read(entry.path)
+      const content = await this._storage.read(entry.path)
       const { description, body } = parseFrontmatter(content)
       const searchable = `${entry.path} ${description} ${body}`.toLowerCase()
 
@@ -246,8 +244,12 @@ export class FileMemoryStore implements MemoryStore {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Private — tree rendering
+  // ---------------------------------------------------------------------------
+
   private async _renderTreeLevel(prefix: string, lines: string[], depth: number): Promise<void> {
-    const entries = await this._backend.list(prefix)
+    const entries = await this._storage.list(prefix)
     const indent = '│   '.repeat(depth - 1) + '├── '
 
     for (const entry of entries) {
@@ -259,7 +261,7 @@ export class FileMemoryStore implements MemoryStore {
       } else {
         const fileName = entry.path.split('/').pop()!
         try {
-          const content = await this._backend.read(entry.path)
+          const content = await this._storage.read(entry.path)
           const { description } = parseFrontmatter(content)
           const desc = description ? ` — "${description}"` : ''
           lines.push(`${indent}${fileName}${desc}`)
@@ -270,8 +272,12 @@ export class FileMemoryStore implements MemoryStore {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Private — tools
+  // ---------------------------------------------------------------------------
+
   private _readFileTool(): Tool {
-    const backend = this._backend
+    const storage = this._storage
     return tool({
       name: 'read_memory_file',
       description: 'Read a specific knowledge file from memory. Use the file tree to identify relevant files.',
@@ -291,7 +297,7 @@ export class FileMemoryStore implements MemoryStore {
           return 'Error: path must be under knowledge/'
         }
         try {
-          const content = await backend.read(path)
+          const content = await storage.read(path)
           const { body } = parseFrontmatter(content)
           return body.trim()
         } catch {
@@ -302,7 +308,7 @@ export class FileMemoryStore implements MemoryStore {
   }
 
   private _grepTool(): Tool {
-    const backend = this._backend
+    const storage = this._storage
     return tool({
       name: 'grep_memory',
       description:
@@ -323,14 +329,14 @@ export class FileMemoryStore implements MemoryStore {
         const matches: Array<{ path: string; excerpt: string }> = []
 
         const searchDir = async (prefix: string): Promise<void> => {
-          const entries = await backend.list(prefix)
+          const entries = await storage.list(prefix)
           for (const entry of entries) {
             if (entry.isDirectory) {
               await searchDir(entry.path)
               continue
             }
             try {
-              const content = await backend.read(entry.path)
+              const content = await storage.read(entry.path)
               const lower = content.toLowerCase()
               const idx = lower.indexOf(queryLower)
               if (idx !== -1) {
@@ -355,24 +361,36 @@ export class FileMemoryStore implements MemoryStore {
     })
   }
 
+  // ---------------------------------------------------------------------------
+  // Private — consolidation
+  // ---------------------------------------------------------------------------
+
   private async _scopeFiles(scope: 'since-last' | 'all'): Promise<string[]> {
     if (scope === 'all') {
       return this._collectAllFiles(KNOWLEDGE_PREFIX)
     }
 
     const lastTimestamp = await this._readLastConsolidationTimestamp()
-    const changes = await this._backend.changesSince(lastTimestamp)
-    const paths = new Set<string>()
-    for (const change of changes) {
-      if (change.path.startsWith(KNOWLEDGE_PREFIX + '/') && change.operation === 'write') {
-        paths.add(change.path)
+    return this._collectFilesSince(KNOWLEDGE_PREFIX, lastTimestamp)
+  }
+
+  private async _collectFilesSince(prefix: string, timestamp: number): Promise<string[]> {
+    const entries = await this._storage.list(prefix)
+    const files: string[] = []
+    for (const entry of entries) {
+      if (entry.isDirectory) {
+        files.push(...(await this._collectFilesSince(entry.path, timestamp)))
+      } else if (entry.mtime !== undefined && entry.mtime > timestamp) {
+        files.push(entry.path)
+      } else if (entry.mtime === undefined) {
+        files.push(entry.path)
       }
     }
-    return [...paths]
+    return files
   }
 
   private async _collectAllFiles(prefix: string): Promise<string[]> {
-    const entries = await this._backend.list(prefix)
+    const entries = await this._storage.list(prefix)
     const files: string[] = []
     for (const entry of entries) {
       if (entry.isDirectory) {
@@ -403,7 +421,7 @@ export class FileMemoryStore implements MemoryStore {
     const fileContents: string[] = []
     for (const filePath of paths) {
       try {
-        const content = await this._backend.read(filePath)
+        const content = await this._storage.read(filePath)
         fileContents.push(`--- ${filePath} ---\n${content}`)
       } catch {
         // File may have been deleted between scope and execution
@@ -459,7 +477,7 @@ export class FileMemoryStore implements MemoryStore {
   }
 
   private _consolidationReadTool(): Tool {
-    const backend = this._backend
+    const storage = this._storage
     return tool({
       name: 'read_file',
       description: 'Read a knowledge file by path.',
@@ -471,7 +489,7 @@ export class FileMemoryStore implements MemoryStore {
       callback: async (input: unknown): Promise<JSONValue> => {
         const { path } = input as { path: string }
         try {
-          return await backend.read(path)
+          return await storage.read(path)
         } catch {
           return `Error: file not found: ${path}`
         }
@@ -480,7 +498,7 @@ export class FileMemoryStore implements MemoryStore {
   }
 
   private _consolidationWriteTool(): Tool {
-    const backend = this._backend
+    const storage = this._storage
     return tool({
       name: 'write_file',
       description: 'Write or overwrite a knowledge file. Content should be markdown with YAML frontmatter.',
@@ -497,14 +515,14 @@ export class FileMemoryStore implements MemoryStore {
         if (!path.startsWith(KNOWLEDGE_PREFIX + '/')) {
           return 'Error: path must be under knowledge/'
         }
-        await backend.write(path, content)
+        await storage.write(path, content)
         return `Written: ${path}`
       },
     })
   }
 
   private _consolidationDeleteTool(): Tool {
-    const backend = this._backend
+    const storage = this._storage
     return tool({
       name: 'delete_file',
       description: 'Delete a knowledge file.',
@@ -518,7 +536,7 @@ export class FileMemoryStore implements MemoryStore {
         if (!path.startsWith(KNOWLEDGE_PREFIX + '/')) {
           return 'Error: path must be under knowledge/'
         }
-        await backend.delete(path)
+        await storage.delete(path)
         return `Deleted: ${path}`
       },
     })
@@ -527,7 +545,7 @@ export class FileMemoryStore implements MemoryStore {
   private async _readLastConsolidationTimestamp(): Promise<number> {
     const changelogPath = `consolidation/changelog.md`
     try {
-      const content = await this._backend.read(changelogPath)
+      const content = await this._storage.read(changelogPath)
       const match = content.match(/^## (\d{4}-\d{2}-\d{2}T[\d:.]+Z)/m)
       if (match?.[1]) {
         return new Date(match[1]).getTime()
@@ -545,11 +563,11 @@ export class FileMemoryStore implements MemoryStore {
 
     let existing = ''
     try {
-      existing = await this._backend.read(changelogPath)
+      existing = await this._storage.read(changelogPath)
     } catch {
       // First consolidation
     }
 
-    await this._backend.write(changelogPath, entry + existing)
+    await this._storage.write(changelogPath, entry + existing)
   }
 }
