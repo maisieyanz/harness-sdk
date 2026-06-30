@@ -15,7 +15,7 @@ The Strands SDK has no local memory store. The existing store implementation, `B
 
 Separately, any long-lived memory system needs a maintenance mechanism. As memory accumulates over extended interactions, quality degrades — redundancy grows, contradictions go unresolved, and retrieval becomes less reliable. Managed stores like `BedrockKnowledgeBaseStore` handle this server-side — deduplication, indexing, and retrieval quality are responsibilities of the backend service. This works because the infrastructure runs outside the agent loop: it can process knowledge asynchronously, build embeddings, and serve semantic search without adding latency to agent sessions. A local store needs an equivalent offline step to prevent quality from degrading over time.
 
-`FileMemoryStore` addresses both needs. It organizes knowledge as a structured file hierarchy that the agent can navigate directly, and exposes consolidation as an offline maintenance step — analogous to how managed backends process knowledge asynchronously. By running offline, this step can also build local indexes, enabling semantic search without a managed vector service.
+`FileMemoryStore` addresses both needs. It organizes knowledge as a structured file hierarchy that the agent can navigate directly, and exposes consolidation as an offline maintenance step — analogous to how managed backends process knowledge asynchronously. By running offline, this step can also build local indexes, enabling semantic search without a managed vector service. Because it operates through a `FileStorage` interface, the backend can be extended to git-based storage, S3, or any other persistence layer without changing the core memory model.
 
 ---
 
@@ -67,7 +67,7 @@ Not everything loads into context every turn. The agent retrieves relevant knowl
 
 These are not mutually exclusive, and the user controls which are active:
 
-| Mechanism | Controlled by | How it works witFh `FileMemoryStore` |
+| Mechanism | Controlled by | How it works with `FileMemoryStore` |
 |-----------|---------------|-------------------------------------|
 | Injection | `MemoryManager` config (`injection: true`) | Calls `FileMemoryStore.search()` (keyword matching) → injects results as `<memory>` XML |
 | `search_memory` tool | Agent-initiated | Same — calls `FileMemoryStore.search()` |
@@ -136,7 +136,7 @@ interface FileMemoryStoreConfig {
 
   // Optional (MemoryStore interface)
   description?: string;
-  limit?: number;
+  maxSearchResults?: number;
   extraction?: ExtractionConfig;
 
   // Optional with defaults
@@ -407,16 +407,16 @@ const myStore = new FileMemoryStore({
 </details>
 
 <details>
-  <summary><b>Appendix C: FileBackend — Versioning and Rollback (Nice to Have)</b></summary>
+  <summary><b>Appendix C: Versioning and Rollback (Nice to Have)</b></summary>
 
-The core `FileMemoryStore` operates on `FileStorage` alone — no versioning required. For developers who want rollback support and richer change tracking (e.g., undoing bad consolidation), a `FileBackend` interface can be layered on top. This is a nice-to-have extension, not a requirement for the initial implementation.
+The core `FileMemoryStore` operates on `FileStorage` alone — no versioning required. For developers who want rollback support and richer change tracking (e.g., undoing bad consolidation), `FileStorage` implementations can optionally expose versioning methods. This is a nice-to-have extension, not a requirement for the initial implementation.
 
-Beyond versioning, `FileBackend` is also the path to supporting different storage backends (git, S3, etc.). Since `FileMemoryStore` is bound to `FileStorage` (a concrete local filesystem class), `FileBackend` serves as the abstraction layer where backend-specific behavior plugs in — allowing the memory system to expand beyond local-only storage without changing the core `FileMemoryStore` interface.
+### Versioning Extension
 
-The `FileBackend` interface defines versioning operations independently of file operations:
+Backends that support versioning can additionally implement `changesSince()` and `rollback()`:
 
 ```typescript
-interface FileBackend {
+interface VersionedFileStorage extends FileStorage {
   changesSince(timestamp: number): Promise<FileChange[]>;
   rollback(path: string, timestamp: number): Promise<void>;
 }
@@ -428,28 +428,27 @@ interface FileChange {
 }
 ```
 
-**`changesSince(timestamp)`** returns all writes and deletes after the given timestamp — used by consolidation for precise `"since-last"` scoping. **`rollback(path, timestamp)`** restores a file to its state at the given timestamp — used to undo bad consolidation.
+**`changesSince(timestamp)`** returns all writes and deletes after the given timestamp — used by consolidation for precise `"since-last"` scoping (instead of falling back to mtime). **`rollback(path, timestamp)`** restores a file to its state at the given timestamp — used to undo bad consolidation.
 
-| Backend | How it versions |
-|---------|----------------|
-| `LocalFileBackend` | Copies previous content to `.versions/{path}/{timestamp}` before overwriting; maintains a `.journal` file for `changesSince()` |
-| `GitFileBackend` | `git log`, `git show`, `git revert` — free, built into the storage |
-| `S3FileBackend` | S3 object versioning — managed by the service |
+| Implementation | How it versions |
+|---------------|----------------|
+| Local `FileStorage` | Copies previous content to `.versions/{path}/{timestamp}` before overwriting; maintains a `.journal` file for `changesSince()` |
+| `S3Storage` | S3 object versioning — managed by the service |
+| `GithubStorage` | Git commits — `changesSince` maps to commit history, `rollback` restores from a prior commit |
 
 ### Git-Based Example
 
-A git-based versioning backend:
-
 ```typescript
-class GitFileBackend implements FileBackend {
-  private rootPath: string;
+class GithubStorage implements VersionedFileStorage {
+  // FileStorage methods
+  async read(path: string) { /* GitHub Contents API GET */ }
+  async write(path: string, content: string) { /* GitHub Contents API PUT (creates commit) */ }
+  async delete(path: string) { /* GitHub Contents API DELETE */ }
+  async list(prefix?: string) { /* GitHub Trees API */ }
 
-  constructor({ rootPath }: { rootPath: string }) {
-    this.rootPath = rootPath;
-  }
-
-  async changesSince(timestamp: number) { /* git log --since */ }
-  async rollback(path: string, timestamp: number) { /* git show <commit>:<path> + write */ }
+  // Versioning methods
+  async changesSince(timestamp: number) { /* git log --since via Commits API */ }
+  async rollback(path: string, timestamp: number) { /* restore file content from prior commit */ }
 }
 ```
 
@@ -461,56 +460,36 @@ When the agent extracts a fact, `FileMemoryStore.add()` writes through its `File
 agent extracts "user prefers dark mode"
   → FileMemoryStore.add(content, { title: "dark-mode" })
     → FileStorage.write("knowledge/facts/dark-mode.md", content)
-      → fs.writeFile(".agent-memory/knowledge/facts/dark-mode.md", content)
+      → fs.writeFile(".agent-memory/knowledge/facts/dark-mode.md", content)  // local
+      → s3.PutObject(...)                                                    // S3
+      → github.createOrUpdateFileContents(...)                               // GitHub
 ```
 
-When consolidation runs with `scope: "since-last"`, it calls `GitFileBackend.changesSince()` to determine which files to process, then reads/writes through `FileStorage`:
+When consolidation runs with `scope: "since-last"` and the storage supports versioning:
 
 ```
 myStore.consolidate({ model, operations: ["deduplicate"], scope: "since-last" })
-  → GitFileBackend.changesSince(lastTimestamp) → git log --since
-  → consolidation agent reads files via FileStorage
-  → consolidation agent writes merged/pruned files via FileStorage
+  → storage.changesSince(lastTimestamp)  // precise scoping via version history
+  → consolidation agent reads/writes files via FileStorage
 ```
+
+When the storage does not implement versioning, `since-last` falls back to mtime-based scoping from `list()`.
 
 ### Usage
 
 ```typescript
-const fileStorage = new FileStorage({ rootPath: "./.agent-memory" });
-const gitBackend = new GitFileBackend({ rootPath: "./.agent-memory" });
+const storage = new GithubStorage({ owner: "myorg", repo: "agent-memory", branch: "main" });
 
 const memoryStore = new FileMemoryStore({
     name: "agent-memory",
-    storage: fileStorage,
-    backend: gitBackend,
+    storage,
 });
 
 const agent = new Agent({
     model,
-    contextManager: new ContextManager({ storage: fileStorage }),
     memoryManager: new MemoryManager({ stores: [memoryStore] }),
 });
-```
-
-The developer gets `git log`, `git diff`, and `git revert` for free — same memory model, git-native audit trail.
-
-### Versioning Interface in Practice
-
-The versioning methods on `FileBackend` are called by `FileMemoryStore` during consolidation and rollback:
-
-```typescript
-const gitBackend = new GitFileBackend({ rootPath: "./.agent-memory" });
-
-// Scoping: get all files that changed since a timestamp (used by consolidation "since-last")
-const changes = await gitBackend.changesSince(1718234000);
-// → [{ path: "knowledge/facts/dark-mode.md", timestamp: 1718234500, operation: "write" },
-//    { path: "knowledge/facts/old-process.md", timestamp: 1718300000, operation: "delete" }]
-
-// Rollback: restore a file to its state at a prior timestamp (used to undo bad consolidation)
-await gitBackend.rollback("knowledge/facts/editor-preferences.md", 1718234000);
-```
-
-For `GitFileBackend`, `changesSince()` maps to `git log --since` and `rollback()` maps to `git show <commit>:<path>` + write. For `LocalFileBackend`, these use the `.journal` file and `.versions/` snapshots respectively.
+`
 
 </details>
 
@@ -608,18 +587,18 @@ Measure the relationship between consolidation frequency and token cost vs. retr
 
 | Criterion | Measure |
 |-----------|---------|
-| SDK integration | A working `FileMemoryStore` that plugs into both `contextManager.storage` and `memoryManager.stores` — passing integration tests with the existing SDK |
+| SDK integration | A working `FileMemoryStore` that plugs into `memoryManager.stores`, with both L1 and L2 sharing a `FileStorage` instance — passing integration tests with the existing SDK |
 | Auditable history | `consolidation/changelog.md` tells a coherent story of what the agent learned and when — a developer can trace how memory evolved over time without inspecting individual file diffs |
 | Consolidation quality | Benchmark showing how consolidation changes retrieval quality (e.g., DMR recall before/after consolidation runs) |
 | Progressive disclosure efficiency | Benchmark measuring how progressive disclosure changes tokens loaded per turn and retrieval accuracy vs. full-context injection |
 | Inspectable | A developer can browse the memory directory and diff file changes directly — the file hierarchy is human-readable and diffable |
 
-### Nice to Have
+### Stretch Goals / Nice to Have
 
 | Criterion | Measure |
 |-----------|---------|
-| CLI consolidation | A CLI entrypoint for running consolidation outside of an agent session (e.g., `npx strands-memory consolidate --path ./.agent-memory`) |
-| FileBackend versioning | A `FileBackend` interface providing `changesSince()` and `rollback()` for precise change tracking and undo support — see [Appendix C](#appendix-c-filebackend--versioning-and-rollback-nice-to-have) |
+| Versioning extension | A `VersionedFileStorage` interface extending `FileStorage` with `changesSince()` and `rollback()` for precise change tracking and undo support — see [Appendix C](#appendix-c-versioning-and-rollback-nice-to-have) |
+| `GithubStorage` | A `FileStorage` implementation backed by GitHub repos (Contents API for read/write/delete, Trees API for list). Gives git-native versioning for free — every `write()` is a commit, `changesSince()` maps to commit history, and `rollback()` restores from a prior commit SHA. Enables shared, collaborative agent memory across teams via standard git workflows (PRs for consolidation review, branch protection for `system/`, `.github/workflows/` for scheduled consolidation). |
 | Comparative benchmarks | Benchmark comparison against managed alternatives (`BedrockKnowledgeBaseStore`) and in-memory baselines showing where a local file store adds value and where it doesn't |
 | End-to-end deployed example | A deployed Strands agent (code review, coding assistant, or similar) that uses `FileMemoryStore` for memory accumulation across sessions, with scheduled consolidation via GitHub Actions. Deployed for an internal team use case (e.g., a code review agent that remembers codebase patterns, or an onboarding agent that accumulates project knowledge) AND publishable as a labs/devtools sample demonstrating the full lifecycle: agent learns → memory accumulates → consolidation improves → agent gets better over time |
 
