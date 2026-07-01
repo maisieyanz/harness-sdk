@@ -1,50 +1,37 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { FileMemoryStore } from '../file-memory-store.js'
 import type { InvokableTool } from '../../../tools/tool.js'
-import type { FileStorage, FileEntry } from '../types.js'
+import type { Storage } from '../../../storage/storage.js'
 
-class InMemoryStorage implements FileStorage {
-  private _files = new Map<string, { content: string; timestamp: number }>()
+/**
+ * In-memory implementation of the unified Storage interface for testing.
+ */
+class InMemoryStorage implements Storage {
+  private _store = new Map<string, Uint8Array>()
 
-  async read(path: string): Promise<string> {
-    const entry = this._files.get(path)
-    if (!entry) throw new Error(`file not found: ${path}`)
-    return entry.content
+  async put(key: string, data: Uint8Array): Promise<void> {
+    this._store.set(key, data.slice())
   }
 
-  async write(path: string, content: string): Promise<void> {
-    this._files.set(path, { content, timestamp: Date.now() })
+  async get(key: string): Promise<Uint8Array | null> {
+    const value = this._store.get(key)
+    return value === undefined ? null : value.slice()
   }
 
-  async delete(path: string): Promise<void> {
-    this._files.delete(path)
+  async delete(key: string): Promise<void> {
+    this._store.delete(key)
   }
 
-  async list(prefix?: string): Promise<FileEntry[]> {
-    const entries: FileEntry[] = []
-    const seen = new Set<string>()
-
-    for (const [filePath, file] of this._files.entries()) {
-      const target = prefix ? prefix + '/' : ''
-      if (!filePath.startsWith(target)) continue
-
-      const remainder = filePath.slice(target.length)
-      const slashIdx = remainder.indexOf('/')
-
-      if (slashIdx === -1) {
-        entries.push({ path: filePath, isDirectory: false, mtime: file.timestamp })
-      } else {
-        const dirPath = prefix ? `${prefix}/${remainder.slice(0, slashIdx)}` : remainder.slice(0, slashIdx)
-        if (!seen.has(dirPath)) {
-          seen.add(dirPath)
-          entries.push({ path: dirPath, isDirectory: true })
-        }
-      }
+  async list(prefix: string): Promise<string[]> {
+    const keys: string[] = []
+    for (const key of this._store.keys()) {
+      if (key.startsWith(prefix)) keys.push(key)
     }
-    return entries
+    return keys.sort()
   }
-
 }
+
+const encoder = new TextEncoder()
 
 describe('FileMemoryStore', () => {
   let storage: InMemoryStorage
@@ -62,13 +49,15 @@ describe('FileMemoryStore', () => {
   describe('add', () => {
     it('writes a markdown file to knowledge/facts/', async () => {
       await store.add('User prefers dark mode', { title: 'dark-mode', description: 'Theme preference' })
-      const content = await storage.read('knowledge/facts/dark-mode.md')
-      expect(content).toContain('dark mode')
+      const content = await storage.get('knowledge/facts/dark-mode.md')
+      expect(content).not.toBeNull()
+      expect(new TextDecoder().decode(content!)).toContain('dark mode')
     })
 
     it('includes frontmatter with description', async () => {
       await store.add('Prefers integration tests', { title: 'testing', description: 'Testing approach' })
-      const content = await storage.read('knowledge/facts/testing.md')
+      const bytes = await storage.get('knowledge/facts/testing.md')
+      const content = new TextDecoder().decode(bytes!)
       expect(content).toContain('---')
       expect(content).toContain('description: "Testing approach"')
       expect(content).toContain('Prefers integration tests')
@@ -76,15 +65,16 @@ describe('FileMemoryStore', () => {
 
     it('derives filename from content when no title provided', async () => {
       await store.add('The user likes vim keybindings')
-      const entries = await storage.list('knowledge/facts')
-      expect(entries.length).toBe(1)
-      expect(entries[0]!.path).toMatch(/knowledge\/facts\/.*\.md$/)
+      const keys = await storage.list('knowledge/facts/')
+      expect(keys.length).toBe(1)
+      expect(keys[0]).toMatch(/knowledge\/facts\/.*\.md$/)
     })
 
     it('derives description from first sentence when not provided', async () => {
       await store.add('Always use strict mode. It prevents bugs.')
-      const entries = await storage.list('knowledge/facts')
-      const content = await storage.read(entries[0]!.path)
+      const keys = await storage.list('knowledge/facts/')
+      const bytes = await storage.get(keys[0]!)
+      const content = new TextDecoder().decode(bytes!)
       expect(content).toContain('description: "Always use strict mode')
     })
   })
@@ -123,13 +113,13 @@ describe('FileMemoryStore', () => {
     })
 
     it('excludes system files from results', async () => {
-      await storage.write(
+      await storage.put(
         'knowledge/system/prefs.md',
-        '---\ndescription: "User prefs"\n---\n\ndark mode everywhere'
+        encoder.encode('---\ndescription: "User prefs"\n---\n\ndark mode everywhere')
       )
       const results = await store.search('dark mode')
       const paths = results.map((r) => r.metadata?.['path'] as string)
-      expect(paths.every((p) => !p.startsWith('knowledge/system'))).toBe(true)
+      expect(paths.every((p) => !p.startsWith('knowledge/system/'))).toBe(true)
     })
   })
 
@@ -193,7 +183,7 @@ describe('FileMemoryStore', () => {
 
   describe('renderFileTree', () => {
     beforeEach(async () => {
-      await storage.write('knowledge/system/prefs.md', '---\ndescription: "Core preferences"\n---\n\nvim mode')
+      await storage.put('knowledge/system/prefs.md', encoder.encode('---\ndescription: "Core preferences"\n---\n\nvim mode'))
       await store.add('Testing approach', { title: 'testing', description: 'Integration-first' })
     })
 
@@ -213,8 +203,8 @@ describe('FileMemoryStore', () => {
 
   describe('loadSystemKnowledge', () => {
     it('returns concatenated content of all system files', async () => {
-      await storage.write('knowledge/system/a.md', '---\ndescription: "A"\n---\n\nContent A')
-      await storage.write('knowledge/system/b.md', '---\ndescription: "B"\n---\n\nContent B')
+      await storage.put('knowledge/system/a.md', encoder.encode('---\ndescription: "A"\n---\n\nContent A'))
+      await storage.put('knowledge/system/b.md', encoder.encode('---\ndescription: "B"\n---\n\nContent B'))
       const result = await store.loadSystemKnowledge()
       expect(result).toContain('Content A')
       expect(result).toContain('Content B')

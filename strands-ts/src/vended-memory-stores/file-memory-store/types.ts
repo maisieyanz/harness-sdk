@@ -5,52 +5,14 @@
 import type { Model } from '../../models/model.js'
 import type { ExtractionConfig } from '../../memory/extraction/types.js'
 import type { MemoryStoreConfig } from '../../memory/types.js'
-
-// ---------------------------------------------------------------------------
-// Storage adapter — placeholder until the unified Storage primitive lands.
-// When `@strands-agents/sdk/storage` ships its `Storage` interface (put/get/delete/list),
-// this block gets replaced with a direct import and thin adapter. Until then, the
-// FileMemoryStore operates through this minimal contract so the rest of the module
-// (consolidation, progressive disclosure, search) stays decoupled from the eventual
-// Storage implementation details.
-// ---------------------------------------------------------------------------
-
-/**
- * A single entry in a directory listing.
- * @internal
- */
-export interface FileEntry {
-  path: string
-  isDirectory: boolean
-  mtime?: number
-}
-
-/**
- * Stub for the unified Storage primitive. Will be replaced by `Storage` from
- * `@strands-agents/sdk/storage` when it ships (put/get/delete/list on Uint8Array).
- * @internal
- */
-export interface FileStorage {
-  read(path: string): Promise<string>
-  write(path: string, content: string): Promise<void>
-  delete(path: string): Promise<void>
-  list(prefix?: string): Promise<FileEntry[]>
-}
-
-// ---------------------------------------------------------------------------
-// Public types
-// ---------------------------------------------------------------------------
+import type { Storage } from '../../storage/storage.js'
 
 /**
  * Configuration for {@link FileMemoryStore}.
  */
 export interface FileMemoryStoreConfig extends Omit<MemoryStoreConfig, 'writable'> {
-  /**
-   * Storage adapter for file operations. Placeholder until the unified Storage
-   * primitive ships — at that point this becomes `storage: Storage` from
-   * `@strands-agents/sdk/storage`.
-   */
-  storage: FileStorage
+  /** The unified Storage backend for file operations. */
+  storage: Storage
   /** Maximum tokens to include when rendering the file tree for injection. */
   retrieval?: { maxTokens?: number }
   /**

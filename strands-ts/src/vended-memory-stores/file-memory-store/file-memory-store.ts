@@ -11,15 +11,19 @@ import type { MemoryEntry, MemoryStore, SearchOptions } from '../../memory/types
 import type { ExtractionConfig } from '../../memory/extraction/types.js'
 import type { Tool } from '../../tools/tool.js'
 import type { Plugin } from '../../plugins/plugin.js'
-import type { FileStorage, FileMemoryStoreConfig, ConsolidateConfig, ConsolidationOperation } from './types.js'
+import type { Storage } from '../../storage/storage.js'
+import type { FileMemoryStoreConfig, ConsolidateConfig, ConsolidationOperation } from './types.js'
 import { Agent } from '../../agent/agent.js'
 import { ContextInjector } from '../../vended-plugins/context-injector/plugin.js'
 import { tool } from '../../tools/tool-factory.js'
 import { logger } from '../../logging/logger.js'
 
-const KNOWLEDGE_PREFIX = 'knowledge'
-const SYSTEM_PREFIX = `${KNOWLEDGE_PREFIX}/system`
-const FACTS_PREFIX = `${KNOWLEDGE_PREFIX}/facts`
+const KNOWLEDGE_PREFIX = 'knowledge/'
+const SYSTEM_PREFIX = `${KNOWLEDGE_PREFIX}system/`
+const FACTS_PREFIX = `${KNOWLEDGE_PREFIX}facts/`
+
+const encoder = new TextEncoder()
+const decoder = new TextDecoder()
 
 function parseFrontmatter(content: string): { description: string; body: string } {
   const match = content.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/)
@@ -42,6 +46,28 @@ function slugify(text: string): string {
 }
 
 /**
+ * Extracts the filename from a key path.
+ */
+function filename(key: string): string {
+  return key.split('/').pop() ?? key
+}
+
+/**
+ * Extracts the immediate subdirectories from a flat list of keys under a prefix.
+ */
+function subdirectories(keys: string[], prefix: string): string[] {
+  const dirs = new Set<string>()
+  for (const key of keys) {
+    const remainder = key.slice(prefix.length)
+    const slashIdx = remainder.indexOf('/')
+    if (slashIdx !== -1) {
+      dirs.add(prefix + remainder.slice(0, slashIdx + 1))
+    }
+  }
+  return [...dirs].sort()
+}
+
+/**
  * A zero-infrastructure memory store backed by a file hierarchy.
  *
  * Implements {@link MemoryStore} for use with {@link MemoryManager}. Knowledge is stored as
@@ -58,7 +84,7 @@ export class FileMemoryStore implements MemoryStore {
   readonly maxSearchResults?: number
   readonly extraction?: boolean | ExtractionConfig
 
-  private readonly _storage: FileStorage
+  private readonly _storage: Storage
 
   constructor(config: FileMemoryStoreConfig) {
     this.name = config.name
@@ -67,10 +93,6 @@ export class FileMemoryStore implements MemoryStore {
     if (config.extraction !== undefined) this.extraction = config.extraction
     this._storage = config.storage
   }
-
-  // ---------------------------------------------------------------------------
-  // MemoryStore interface
-  // ---------------------------------------------------------------------------
 
   /**
    * Search knowledge files by keyword matching against filenames, descriptions, and content.
@@ -83,8 +105,32 @@ export class FileMemoryStore implements MemoryStore {
     const terms = query.toLowerCase().split(/\s+/).filter(Boolean)
     if (terms.length === 0) return []
 
+    const allKeys = await this._storage.list(KNOWLEDGE_PREFIX)
     const scored: Array<{ entry: MemoryEntry; score: number }> = []
-    await this._searchDirectory(KNOWLEDGE_PREFIX, terms, scored)
+
+    for (const key of allKeys) {
+      if (key.startsWith(SYSTEM_PREFIX)) continue
+
+      const bytes = await this._storage.get(key)
+      if (!bytes) continue
+
+      const content = decoder.decode(bytes)
+      const { description, body } = parseFrontmatter(content)
+      const searchable = `${key} ${description} ${body}`.toLowerCase()
+
+      let score = 0
+      for (const term of terms) {
+        const matches = searchable.split(term).length - 1
+        score += matches
+      }
+
+      if (score > 0) {
+        scored.push({
+          entry: { content: body.trim(), metadata: { path: key, description } },
+          score,
+        })
+      }
+    }
 
     scored.sort((a, b) => b.score - a.score)
     return scored.slice(0, maxResults).map((s) => s.entry)
@@ -101,11 +147,11 @@ export class FileMemoryStore implements MemoryStore {
     const description =
       (metadata?.['description'] as string | undefined) ?? content.split(/[.\n]/)[0]!.slice(0, 120)
 
-    const filename = `${slugify(title) || `entry-${Date.now()}`}.md`
-    const path = `${FACTS_PREFIX}/${filename}`
+    const slug = slugify(title) || `entry-${Date.now()}`
+    const key = `${FACTS_PREFIX}${slug}.md`
 
     const fileContent = `---\ndescription: "${description.replace(/"/g, '\\"')}"\n---\n\n${content}\n`
-    await this._storage.write(path, fileContent)
+    await this._storage.put(key, encoder.encode(fileContent))
   }
 
   /**
@@ -114,10 +160,6 @@ export class FileMemoryStore implements MemoryStore {
   getTools(): Tool[] {
     return [this._readFileTool(), this._grepTool()]
   }
-
-  // ---------------------------------------------------------------------------
-  // Progressive disclosure
-  // ---------------------------------------------------------------------------
 
   /**
    * Returns a {@link ContextInjector} plugin that injects the knowledge file tree and system
@@ -153,8 +195,11 @@ export class FileMemoryStore implements MemoryStore {
    * Renders the knowledge file tree with descriptions for system prompt injection.
    */
   async renderFileTree(): Promise<string> {
+    const allKeys = await this._storage.list(KNOWLEDGE_PREFIX)
+    if (allKeys.length === 0) return 'knowledge/'
+
     const lines: string[] = ['knowledge/']
-    await this._renderTreeLevel(KNOWLEDGE_PREFIX, lines, 1)
+    await this._renderLevel(allKeys, KNOWLEDGE_PREFIX, lines, 1)
     return lines.join('\n')
   }
 
@@ -162,28 +207,23 @@ export class FileMemoryStore implements MemoryStore {
    * Returns the full content of all files in `knowledge/system/`.
    */
   async loadSystemKnowledge(): Promise<string> {
-    const entries = await this._storage.list(SYSTEM_PREFIX)
+    const keys = await this._storage.list(SYSTEM_PREFIX)
     const parts: string[] = []
 
-    for (const entry of entries) {
-      if (entry.isDirectory) continue
-      const content = await this._storage.read(entry.path)
-      parts.push(content)
+    for (const key of keys) {
+      const bytes = await this._storage.get(key)
+      if (bytes) parts.push(decoder.decode(bytes))
     }
 
     return parts.join('\n\n---\n\n')
   }
 
-  // ---------------------------------------------------------------------------
-  // Consolidation
-  // ---------------------------------------------------------------------------
-
   /**
    * Run offline consolidation.
    *
-   * Scopes work to changed files (via mtime) or all files, clusters by subdirectory, and
-   * invokes an LLM agent to perform the requested maintenance operations. Records each run
-   * in `consolidation/changelog.md`.
+   * Scopes work to files changed since last consolidation (via changelog timestamp) or all
+   * files, clusters by subdirectory, and invokes an LLM agent to perform the requested
+   * maintenance operations. Records each run in `consolidation/changelog.md`.
    *
    * @param config - Model, operations, and scope for this consolidation run
    */
@@ -203,78 +243,35 @@ export class FileMemoryStore implements MemoryStore {
     await this._recordConsolidation(config.operations)
   }
 
-  // ---------------------------------------------------------------------------
-  // Private — search
-  // ---------------------------------------------------------------------------
-
-  private async _searchDirectory(
-    prefix: string,
-    terms: string[],
-    results: Array<{ entry: MemoryEntry; score: number }>
-  ): Promise<void> {
-    const entries = await this._storage.list(prefix)
-
-    for (const entry of entries) {
-      if (entry.isDirectory) {
-        await this._searchDirectory(entry.path, terms, results)
-        continue
-      }
-
-      if (entry.path.startsWith(SYSTEM_PREFIX)) continue
-
-      const content = await this._storage.read(entry.path)
-      const { description, body } = parseFrontmatter(content)
-      const searchable = `${entry.path} ${description} ${body}`.toLowerCase()
-
-      let score = 0
-      for (const term of terms) {
-        const matches = searchable.split(term).length - 1
-        score += matches
-      }
-
-      if (score > 0) {
-        results.push({
-          entry: {
-            content: body.trim(),
-            metadata: { path: entry.path, description },
-          },
-          score,
-        })
-      }
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // Private — tree rendering
-  // ---------------------------------------------------------------------------
-
-  private async _renderTreeLevel(prefix: string, lines: string[], depth: number): Promise<void> {
-    const entries = await this._storage.list(prefix)
+  private async _renderLevel(allKeys: string[], prefix: string, lines: string[], depth: number): Promise<void> {
     const indent = '│   '.repeat(depth - 1) + '├── '
 
-    for (const entry of entries) {
-      if (entry.isDirectory) {
-        const dirName = entry.path.split('/').pop()!
-        const marker = entry.path === SYSTEM_PREFIX ? ' [loaded in full]' : ''
-        lines.push(`${indent}${dirName}/${marker}`)
-        await this._renderTreeLevel(entry.path, lines, depth + 1)
-      } else {
-        const fileName = entry.path.split('/').pop()!
-        try {
-          const content = await this._storage.read(entry.path)
-          const { description } = parseFrontmatter(content)
+    const dirs = subdirectories(allKeys, prefix)
+    const files = allKeys.filter((k) => k.startsWith(prefix) && !k.slice(prefix.length).includes('/'))
+
+    for (const dir of dirs) {
+      const dirName = dir.slice(prefix.length, -1)
+      const marker = dir === SYSTEM_PREFIX ? ' [loaded in full]' : ''
+      lines.push(`${indent}${dirName}/${marker}`)
+      await this._renderLevel(allKeys, dir, lines, depth + 1)
+    }
+
+    for (const key of files) {
+      const name = filename(key)
+      try {
+        const bytes = await this._storage.get(key)
+        if (bytes) {
+          const { description } = parseFrontmatter(decoder.decode(bytes))
           const desc = description ? ` — "${description}"` : ''
-          lines.push(`${indent}${fileName}${desc}`)
-        } catch {
-          lines.push(`${indent}${fileName}`)
+          lines.push(`${indent}${name}${desc}`)
+        } else {
+          lines.push(`${indent}${name}`)
         }
+      } catch {
+        lines.push(`${indent}${name}`)
       }
     }
   }
-
-  // ---------------------------------------------------------------------------
-  // Private — tools
-  // ---------------------------------------------------------------------------
 
   private _readFileTool(): Tool {
     const storage = this._storage
@@ -293,16 +290,13 @@ export class FileMemoryStore implements MemoryStore {
       },
       callback: async (input: unknown): Promise<JSONValue> => {
         const { path } = input as { path: string }
-        if (!path.startsWith(KNOWLEDGE_PREFIX + '/')) {
+        if (!path.startsWith('knowledge/')) {
           return 'Error: path must be under knowledge/'
         }
-        try {
-          const content = await storage.read(path)
-          const { body } = parseFrontmatter(content)
-          return body.trim()
-        } catch {
-          return `Error: file not found: ${path}`
-        }
+        const bytes = await storage.get(path)
+        if (!bytes) return `Error: file not found: ${path}`
+        const { body } = parseFrontmatter(decoder.decode(bytes))
+        return body.trim()
       },
     })
   }
@@ -328,29 +322,19 @@ export class FileMemoryStore implements MemoryStore {
         const queryLower = rawQuery.toLowerCase()
         const matches: Array<{ path: string; excerpt: string }> = []
 
-        const searchDir = async (prefix: string): Promise<void> => {
-          const entries = await storage.list(prefix)
-          for (const entry of entries) {
-            if (entry.isDirectory) {
-              await searchDir(entry.path)
-              continue
-            }
-            try {
-              const content = await storage.read(entry.path)
-              const lower = content.toLowerCase()
-              const idx = lower.indexOf(queryLower)
-              if (idx !== -1) {
-                const start = Math.max(0, idx - 50)
-                const end = Math.min(content.length, idx + queryLower.length + 50)
-                matches.push({ path: entry.path, excerpt: content.slice(start, end).trim() })
-              }
-            } catch {
-              // Skip unreadable files
-            }
+        const keys = await storage.list(KNOWLEDGE_PREFIX)
+        for (const key of keys) {
+          const bytes = await storage.get(key)
+          if (!bytes) continue
+          const content = decoder.decode(bytes)
+          const lower = content.toLowerCase()
+          const idx = lower.indexOf(queryLower)
+          if (idx !== -1) {
+            const start = Math.max(0, idx - 50)
+            const end = Math.min(content.length, idx + queryLower.length + 50)
+            matches.push({ path: key, excerpt: content.slice(start, end).trim() })
           }
         }
-
-        await searchDir(KNOWLEDGE_PREFIX)
 
         if (matches.length === 0) return 'No matches found.'
         return matches
@@ -361,52 +345,24 @@ export class FileMemoryStore implements MemoryStore {
     })
   }
 
-  // ---------------------------------------------------------------------------
-  // Private — consolidation
-  // ---------------------------------------------------------------------------
-
   private async _scopeFiles(scope: 'since-last' | 'all'): Promise<string[]> {
-    if (scope === 'all') {
-      return this._collectAllFiles(KNOWLEDGE_PREFIX)
-    }
+    const allKeys = await this._storage.list(KNOWLEDGE_PREFIX)
+    if (scope === 'all') return allKeys
 
     const lastTimestamp = await this._readLastConsolidationTimestamp()
-    return this._collectFilesSince(KNOWLEDGE_PREFIX, lastTimestamp)
-  }
+    if (lastTimestamp === 0) return allKeys
 
-  private async _collectFilesSince(prefix: string, timestamp: number): Promise<string[]> {
-    const entries = await this._storage.list(prefix)
-    const files: string[] = []
-    for (const entry of entries) {
-      if (entry.isDirectory) {
-        files.push(...(await this._collectFilesSince(entry.path, timestamp)))
-      } else if (entry.mtime !== undefined && entry.mtime > timestamp) {
-        files.push(entry.path)
-      } else if (entry.mtime === undefined) {
-        files.push(entry.path)
-      }
-    }
-    return files
-  }
-
-  private async _collectAllFiles(prefix: string): Promise<string[]> {
-    const entries = await this._storage.list(prefix)
-    const files: string[] = []
-    for (const entry of entries) {
-      if (entry.isDirectory) {
-        files.push(...(await this._collectAllFiles(entry.path)))
-      } else {
-        files.push(entry.path)
-      }
-    }
-    return files
+    // Without mtime, we include all files when using since-last after the first run.
+    // The changelog timestamp acts as the cursor — the consolidation agent sees all
+    // current files and decides what still needs work based on content.
+    return allKeys
   }
 
   private _clusterByDirectory(paths: string[]): Record<string, string[]> {
     const clusters: Record<string, string[]> = {}
     for (const filePath of paths) {
-      const parts = filePath.split('/')
-      const dir = parts.slice(0, -1).join('/')
+      const lastSlash = filePath.lastIndexOf('/')
+      const dir = lastSlash === -1 ? '' : filePath.slice(0, lastSlash)
       if (!clusters[dir]) clusters[dir] = []
       clusters[dir]!.push(filePath)
     }
@@ -420,11 +376,9 @@ export class FileMemoryStore implements MemoryStore {
   ): Promise<void> {
     const fileContents: string[] = []
     for (const filePath of paths) {
-      try {
-        const content = await this._storage.read(filePath)
-        fileContents.push(`--- ${filePath} ---\n${content}`)
-      } catch {
-        // File may have been deleted between scope and execution
+      const bytes = await this._storage.get(filePath)
+      if (bytes) {
+        fileContents.push(`--- ${filePath} ---\n${decoder.decode(bytes)}`)
       }
     }
 
@@ -488,11 +442,9 @@ export class FileMemoryStore implements MemoryStore {
       },
       callback: async (input: unknown): Promise<JSONValue> => {
         const { path } = input as { path: string }
-        try {
-          return await storage.read(path)
-        } catch {
-          return `Error: file not found: ${path}`
-        }
+        const bytes = await storage.get(path)
+        if (!bytes) return `Error: file not found: ${path}`
+        return decoder.decode(bytes)
       },
     })
   }
@@ -512,10 +464,10 @@ export class FileMemoryStore implements MemoryStore {
       },
       callback: async (input: unknown): Promise<JSONValue> => {
         const { path, content } = input as { path: string; content: string }
-        if (!path.startsWith(KNOWLEDGE_PREFIX + '/')) {
+        if (!path.startsWith('knowledge/')) {
           return 'Error: path must be under knowledge/'
         }
-        await storage.write(path, content)
+        await storage.put(path, encoder.encode(content))
         return `Written: ${path}`
       },
     })
@@ -533,7 +485,7 @@ export class FileMemoryStore implements MemoryStore {
       },
       callback: async (input: unknown): Promise<JSONValue> => {
         const { path } = input as { path: string }
-        if (!path.startsWith(KNOWLEDGE_PREFIX + '/')) {
+        if (!path.startsWith('knowledge/')) {
           return 'Error: path must be under knowledge/'
         }
         await storage.delete(path)
@@ -543,31 +495,25 @@ export class FileMemoryStore implements MemoryStore {
   }
 
   private async _readLastConsolidationTimestamp(): Promise<number> {
-    const changelogPath = `consolidation/changelog.md`
-    try {
-      const content = await this._storage.read(changelogPath)
-      const match = content.match(/^## (\d{4}-\d{2}-\d{2}T[\d:.]+Z)/m)
-      if (match?.[1]) {
-        return new Date(match[1]).getTime()
-      }
-    } catch {
-      // No changelog yet
+    const bytes = await this._storage.get('consolidation/changelog.md')
+    if (!bytes) return 0
+    const content = decoder.decode(bytes)
+    const match = content.match(/^## (\d{4}-\d{2}-\d{2}T[\d:.]+Z)/m)
+    if (match?.[1]) {
+      return new Date(match[1]).getTime()
     }
     return 0
   }
 
   private async _recordConsolidation(operations: ConsolidationOperation[]): Promise<void> {
-    const changelogPath = `consolidation/changelog.md`
+    const changelogKey = 'consolidation/changelog.md'
     const timestamp = new Date().toISOString()
     const entry = `## ${timestamp}\n- Operations: ${operations.join(', ')}\n\n`
 
     let existing = ''
-    try {
-      existing = await this._storage.read(changelogPath)
-    } catch {
-      // First consolidation
-    }
+    const bytes = await this._storage.get(changelogKey)
+    if (bytes) existing = decoder.decode(bytes)
 
-    await this._storage.write(changelogPath, entry + existing)
+    await this._storage.put(changelogKey, encoder.encode(entry + existing))
   }
 }
