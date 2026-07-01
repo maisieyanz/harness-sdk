@@ -189,7 +189,7 @@ During `consolidate()`, an embedding model computes vectors for each knowledge f
 
 With semantic search in place, `FileMemoryStore` works through the existing `MemoryManager` retrieval mechanisms (injection and `search_memory`) without depending on the agent's judgment to navigate files. The tradeoff: progressive disclosure costs tokens every turn (file tree in system prompt + tool calls for navigation), while semantic search costs tokens only during offline consolidation and is free at runtime.
 
-### Integration with Existing Features
+## Integration with Existing Features
 
 L1 and L2 share the same `FileStorage` instance:
 
@@ -581,7 +581,7 @@ Measure the relationship between consolidation frequency and token cost vs. retr
 </details>
 
 <details>
-  <summary><b>Appendix G: Success Criteria</b></summary>
+  <summary><b>Appendix G: Success Criteria and Stretch Goals</b></summary>
 
 ### Required
 
@@ -599,6 +599,8 @@ Measure the relationship between consolidation frequency and token cost vs. retr
 |-----------|---------|
 | Versioning extension | A `VersionedFileStorage` interface extending `FileStorage` with `changesSince()` and `rollback()` for precise change tracking and undo support — see [Appendix C](#appendix-c-versioning-and-rollback-nice-to-have) |
 | `GithubStorage` | A `FileStorage` implementation backed by GitHub repos (Contents API for read/write/delete, Trees API for list). Gives git-native versioning for free — every `write()` is a commit, `changesSince()` maps to commit history, and `rollback()` restores from a prior commit SHA. Enables shared, collaborative agent memory across teams via standard git workflows (PRs for consolidation review, branch protection for `system/`, `.github/workflows/` for scheduled consolidation). |
+| Semantic search (local index) | During `consolidate()`, compute embeddings for each knowledge file and write to `consolidation/embeddings.json`. At runtime, `search()` embeds the query and does cosine similarity against the index — no infrastructure, no runtime model call, scales to ~1,000 files |
+| Semantic search (vector DB) | For larger-scale deployments, integrate with a vector database (SQLite + vector extension, pgvector, or a managed service) for similarity search. Appropriate when the local index approach hits scaling limits |
 | Comparative benchmarks | Benchmark comparison against managed alternatives (`BedrockKnowledgeBaseStore`) and in-memory baselines showing where a local file store adds value and where it doesn't |
 | End-to-end deployed example | A deployed Strands agent (code review, coding assistant, or similar) that uses `FileMemoryStore` for memory accumulation across sessions, with scheduled consolidation via GitHub Actions. Deployed for an internal team use case (e.g., a code review agent that remembers codebase patterns, or an onboarding agent that accumulates project knowledge) AND publishable as a labs/devtools sample demonstrating the full lifecycle: agent learns → memory accumulates → consolidation improves → agent gets better over time |
 
