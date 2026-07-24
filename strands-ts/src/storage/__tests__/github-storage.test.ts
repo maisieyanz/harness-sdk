@@ -134,6 +134,16 @@ describe('GithubStorage', () => {
       expect(result).toEqual(bytes)
     })
 
+    it('decodes base64 content that GitHub wraps with line breaks', async () => {
+      const bytes = new Uint8Array([9, 8, 7])
+      // GitHub wraps blob base64 at 60 columns; the reader must tolerate the embedded newlines.
+      const wrapped = encodeBase64(bytes).replace(/(.{2})/, '$1\n')
+      octokit.repos.getContent.mockResolvedValue({ data: { type: 'file', content: wrapped } })
+      const storage = newStorage()
+
+      expect(await storage.read('some/key')).toEqual(bytes)
+    })
+
     it('returns null for a 404', async () => {
       octokit.repos.getContent.mockRejectedValue(notFound())
       const storage = newStorage()
@@ -211,6 +221,21 @@ describe('GithubStorage', () => {
       expect(octokit.git.getTree).toHaveBeenCalledWith(
         expect.objectContaining({ tree_sha: 'treesha', recursive: 'true' })
       )
+    })
+
+    it('throws when the tree listing is truncated', async () => {
+      // GitHub's tree API does not paginate, so a truncated response is an incomplete key set;
+      // returning it would let consolidation plan over a partial view and orphan omitted files.
+      octokit.git.getTree.mockResolvedValue({
+        data: {
+          truncated: true,
+          tree: [{ type: 'blob', path: 'a.md' }],
+        },
+      })
+      const storage = newStorage()
+
+      await expect(storage.list('')).rejects.toThrow(StorageError)
+      await expect(storage.list('')).rejects.toThrow(/truncated/)
     })
 
     it('returns an empty list when the branch does not exist', async () => {
@@ -314,6 +339,87 @@ describe('GithubStorage', () => {
 
       expect(octokit.repos.createOrUpdateFileContents).toHaveBeenCalledWith(
         expect.objectContaining({ path: 'sub/a.md' })
+      )
+    })
+
+    it('prefixes the key on read', async () => {
+      const bytes = new Uint8Array([1, 2, 3])
+      octokit.repos.getContent.mockResolvedValue({ data: { type: 'file', content: encodeBase64(bytes) } })
+      const storage = newStorage().namespace('sub')
+
+      expect(await storage.read('a.md')).toEqual(bytes)
+      expect(octokit.repos.getContent).toHaveBeenCalledWith(expect.objectContaining({ path: 'sub/a.md' }))
+    })
+
+    it('prefixes the key on delete', async () => {
+      octokit.repos.getContent.mockResolvedValue({ data: { type: 'file', sha: 'sha1' } })
+      octokit.repos.deleteFile.mockResolvedValue({})
+      const storage = newStorage().namespace('sub')
+
+      await storage.delete('a.md')
+
+      expect(octokit.repos.deleteFile).toHaveBeenCalledWith(expect.objectContaining({ path: 'sub/a.md' }))
+    })
+
+    it('scopes list to the namespace and strips its prefix', async () => {
+      octokit.git.getRef.mockResolvedValue({ data: { object: { sha: 'commitsha' } } })
+      octokit.git.getCommit.mockResolvedValue({ data: { tree: { sha: 'treesha' } } })
+      octokit.git.getTree.mockResolvedValue({
+        data: {
+          truncated: false,
+          tree: [
+            { type: 'blob', path: 'sub/a.md' },
+            { type: 'blob', path: 'other/b.md' },
+          ],
+        },
+      })
+      const storage = newStorage().namespace('sub')
+
+      expect(await storage.list('')).toEqual(['a.md'])
+    })
+  })
+
+  describe('config', () => {
+    beforeEach(() => {
+      octokit.git.getRef.mockResolvedValue({ data: { object: { sha: 'commitsha' } } })
+      octokit.git.getCommit.mockResolvedValue({ data: { tree: { sha: 'treesha' } } })
+      octokit.git.getTree.mockResolvedValue({ data: { truncated: false, tree: [] } })
+    })
+
+    it('reads from and lists against a custom branch', async () => {
+      octokit.repos.getContent.mockRejectedValue(notFound())
+      const storage = newStorage({ branch: 'develop' })
+
+      await storage.read('a.md')
+      expect(octokit.repos.getContent).toHaveBeenCalledWith(expect.objectContaining({ ref: 'develop' }))
+
+      await storage.list('')
+      expect(octokit.git.getRef).toHaveBeenCalledWith(expect.objectContaining({ ref: 'heads/develop' }))
+    })
+
+    it('commits a custom branch and applies a custom commit prefix', async () => {
+      octokit.git.createBlob.mockResolvedValue({ data: { sha: 'blobsha' } })
+      octokit.git.createTree.mockResolvedValue({ data: { sha: 'newtree' } })
+      octokit.git.createCommit.mockResolvedValue({ data: { sha: 'newcommit' } })
+      octokit.git.updateRef.mockResolvedValue({})
+      const storage = newStorage({ branch: 'develop', commitPrefix: 'knowledge' })
+      storage.beginBatch()
+      await storage.write('a.md', encoder.encode('x'))
+      await storage.commitBatch('run')
+
+      expect(octokit.git.createCommit).toHaveBeenCalledWith(expect.objectContaining({ message: 'knowledge: run' }))
+      expect(octokit.git.updateRef).toHaveBeenCalledWith(expect.objectContaining({ ref: 'heads/develop' }))
+    })
+
+    it('applies a custom commit prefix on a per-op write', async () => {
+      octokit.repos.getContent.mockRejectedValue(notFound())
+      octokit.repos.createOrUpdateFileContents.mockResolvedValue({})
+      const storage = newStorage({ commitPrefix: 'knowledge' })
+
+      await storage.write('a.md', encoder.encode('x'))
+
+      expect(octokit.repos.createOrUpdateFileContents).toHaveBeenCalledWith(
+        expect.objectContaining({ message: expect.stringMatching(/^knowledge: /) })
       )
     })
   })

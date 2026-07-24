@@ -1,7 +1,6 @@
 import type { Storage } from './storage.js'
 
 import { StorageError } from '../errors.js'
-import { logger } from '../logging/logger.js'
 import { decodeBase64, encodeBase64 } from '../types/media.js'
 import { namespace, normalizeKey, normalizePrefix } from './storage.js'
 
@@ -53,6 +52,15 @@ const FILE_MODE = '100644'
  * {@link beginBatch}, perform the mutations, then {@link commitBatch} to land them all in one commit,
  * which avoids dozens of commits and the associated API rate-limit pressure. While a batch is open,
  * {@link write} and {@link delete} are queued and not visible to {@link read} until committed.
+ *
+ * This backend performs no built-in retry or rate-limit handling. To add exponential backoff on
+ * throttling (`429`) or transient (`5xx`) responses, pass a `token`-free client configured with the
+ * `@octokit/plugin-throttling` / `@octokit/plugin-retry` plugins via the `octokit` option.
+ *
+ * Writes assume a single writer per branch. {@link commitBatch} and the per-op commit path advance
+ * the branch ref without a compare-and-swap retry, so a concurrent writer that moves the branch head
+ * between read and update surfaces GitHub's non-fast-forward rejection as a {@link StorageError}
+ * rather than being retried.
  *
  * @example
  * ```typescript
@@ -210,7 +218,9 @@ export class GithubStorage implements Storage {
       const response = await client.repos.getContent({ owner: this._owner, repo: this._repo, path, ref: this._branch })
       const file = response.data
       if (Array.isArray(file) || file.type !== 'file' || !('content' in file)) return null
-      return decodeBase64(file.content)
+      // GitHub returns the blob as base64 wrapped at 60 columns. Strip the line breaks explicitly
+      // rather than relying on the decoder's runtime-specific whitespace tolerance.
+      return decodeBase64(file.content.replace(/\s/g, ''))
     } catch (error: unknown) {
       if (isNotFoundError(error)) return null
       throw new StorageError(`Failed to read '${path}' from '${this._owner}/${this._repo}'`, { cause: error })
@@ -269,8 +279,11 @@ export class GithubStorage implements Storage {
         recursive: 'true',
       })
       if (tree.data.truncated) {
-        logger.warn(
-          `owner=<${this._owner}>, repo=<${this._repo}> | github tree listing was truncated, some keys may be missing`
+        // GitHub's git tree API does not paginate, so a truncated response is an incomplete key
+        // set with no way to fetch the remainder. Returning it would let a consolidation run plan
+        // over a partial view and orphan or duplicate the omitted files, so fail loud instead.
+        throw new StorageError(
+          `Tree listing for '${this._owner}/${this._repo}' was truncated by GitHub and cannot be completed — the repository has too many files to list`
         )
       }
       const keys: string[] = []
@@ -281,6 +294,9 @@ export class GithubStorage implements Storage {
       return keys.sort()
     } catch (error: unknown) {
       if (isNotFoundError(error)) return []
+      // Preserve a StorageError we raised ourselves (e.g. truncation) rather than re-wrapping it
+      // into a generic message that buries the specific cause
+      if (error instanceof StorageError) throw error
       throw new StorageError(`Failed to list '${this._owner}/${this._repo}' under '${normalized}'`, { cause: error })
     }
   }
