@@ -1,0 +1,25 @@
+{
+  "name": "file-memory-github",
+  "private": true,
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "prepare": "npm ci --prefix ../../..",
+    "clean": "rm -rf dist node_modules package-lock.json",
+    "build": "tsc",
+    "start": "tsc && node dist/seed.js",
+    "ask": "tsc && node dist/ask.js",
+    "consolidate": "tsc && node dist/consolidate.js"
+  },
+  "workspaces": [
+    "../../"
+  ],
+  "dependencies": {
+    "@strands-agents/sdk": "*",
+    "@octokit/rest": "^22.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.5.0"
+  }
+}
