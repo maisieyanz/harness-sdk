@@ -95,6 +95,12 @@ export class MemoryManager implements Plugin {
   private readonly _addToolStores: MemoryStore[]
   /** Stores with extraction enabled, each paired with its resolved config; wired up in {@link initAgent}. */
   private readonly _extractionStores: ExtractionBinding[]
+  /**
+   * Plugins the stores supply via {@link MemoryStore.getPlugins}. Held rather than re-fetched because
+   * `getPlugins` may build a fresh instance per call, and {@link getTools} must register the tools of
+   * the same instance {@link initAgent} initializes.
+   */
+  private readonly _storePlugins: Plugin[]
   /** Background extraction coordinator, created in {@link initAgent} when extraction is configured. */
   private _coordinator: ExtractionCoordinator | undefined
   /** Resolved injection config, or `false` when injection is disabled. */
@@ -154,6 +160,7 @@ export class MemoryManager implements Plugin {
     // `add`-targeting paths (tool / programmatic) need an `add` method specifically.
     this._addStores = config.stores.filter((s) => s.writable && typeof s.add === 'function')
     this._extractionStores = extractionStores
+    this._storePlugins = config.stores.flatMap((store) => store.getPlugins?.() ?? [])
 
     this._searchToolConfig =
       config.searchToolConfig === false
@@ -208,12 +215,14 @@ export class MemoryManager implements Plugin {
   /**
    * Initializes the plugin with the agent.
    *
-   * Wires up two independent behaviors:
+   * Wires up three independent behaviors:
    * - **Extraction**: for any store configured with {@link ExtractionConfig}, buffers conversation
    *   messages and attaches each store's triggers. A no-op when no store uses extraction.
    * - **Injection**: when enabled, registers an `InvokeModelStage` middleware that folds retrieved
    *   memory into the model input for each call without touching durable history. See
    *   {@link _provideMemoryContext}, the `renderContent` callback the middleware invokes.
+   * - **Store plugins**: initializes any plugin a store supplies via {@link MemoryStore.getPlugins}, so
+   *   a store can reach an extension point a tool cannot without the caller wiring it up.
    *
    * @param agent - The agent this plugin is being attached to
    */
@@ -221,6 +230,10 @@ export class MemoryManager implements Plugin {
     await this._initStores()
     this._initExtraction(agent)
     this._initInjection(agent)
+
+    for (const plugin of this._storePlugins) {
+      await plugin.initAgent(agent)
+    }
   }
 
   /** Call `initialize()` on each store that implements it. */
@@ -407,8 +420,10 @@ export class MemoryManager implements Plugin {
   /**
    * Returns tools registered by this plugin.
    *
-   * Includes the manager's own `search_memory` / `add_memory` tools (per their config) plus any
-   * tools the configured stores expose via {@link MemoryStore.getTools}.
+   * Includes the manager's own `search_memory` / `add_memory` tools (per their config) plus any tools
+   * the configured stores expose via {@link MemoryStore.getTools} or through a plugin they supply. The
+   * `PluginRegistry` registers tools only for the plugins it holds, and a store plugin is held by this
+   * manager rather than the registry, so its tools have to surface here to reach the agent.
    *
    * @returns Array of tools to register with the agent
    */
@@ -424,8 +439,11 @@ export class MemoryManager implements Plugin {
     }
 
     for (const store of this._config.stores) {
-      const storeTools = store.getTools?.() ?? []
-      tools.push(...storeTools)
+      tools.push(...(store.getTools?.() ?? []))
+    }
+
+    for (const plugin of this._storePlugins) {
+      tools.push(...(plugin.getTools?.() ?? []))
     }
 
     return tools

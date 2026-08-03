@@ -17,6 +17,13 @@ export interface FileMemoryStoreConfig extends MemoryStoreConfig {
    * backend share storage — give them different names (or separate storage) to isolate them.
    */
   storage?: Storage
+  /**
+   * Whether to serve retrieval by progressive disclosure: inject the file listing each turn and
+   * register the store's read tool. `false` leaves the store searchable through `search_memory` only.
+   *
+   * @defaultValue true
+   */
+  disclosure?: boolean
 }
 
 /**

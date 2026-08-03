@@ -9,6 +9,8 @@
  * @internal
  */
 
+import { normalizeKey } from '../../storage/storage.js'
+
 /** @internal */
 export const encoder = new TextEncoder()
 
@@ -114,16 +116,26 @@ export function pathsResolveSame(a: string, b: string): boolean {
 }
 
 /**
- * Whether a path contains single-dot segments that the OS would collapse — e.g. `./foo.md` resolves
- * to `foo.md`. Shared between the public `add()` path (which uses it to prevent changelog aliasing
- * that `normalizeKey` does not strip) and consolidation's `validatePath` (which already rejects both
- * `.` and `..`). Does NOT check `..` — that is handled by `normalizeKey` for `add()` and by
- * `validatePath` for plans.
+ * Canonicalize a caller- or model-supplied knowledge path, applying the rules every entry point into
+ * the store must agree on: `normalizeKey` collapses slash runs and rejects `..`, single-dot segments
+ * are rejected because the OS collapses `./x.md` to `x.md` (so it would alias another key), and the
+ * changelog is an audit artifact rather than knowledge. Shared by `add()` and the read tool so a path
+ * cannot be written under one spelling and read under another.
+ *
+ * @throws {@link StorageError} when the path is empty or contains a `..` segment
+ * @throws Error when the path contains a `.` segment or addresses the reserved changelog
  *
  * @internal
  */
-export function containsDotSegments(key: string): boolean {
-  return key.split('/').some((seg) => seg === '.')
+export function assertKnowledgePath(path: string): string {
+  const key = normalizeKey(path)
+  if (key.split('/').some((segment) => segment === '.')) {
+    throw new Error(`Invalid memory path '${path}': must not contain '.' segments`)
+  }
+  if (isConsolidationChangelog(key)) {
+    throw new Error(`Invalid memory path '${path}': must not be the reserved '${CONSOLIDATION_CHANGELOG}' file`)
+  }
+  return key
 }
 
 /**

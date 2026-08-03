@@ -2,25 +2,28 @@
  * File-based memory store implementing the {@link MemoryStore} interface.
  *
  * Organizes knowledge as a structured file hierarchy under a `memory/` storage namespace. Provides
- * keyword-based search via `search_memory` (registered by {@link MemoryManager}).
+ * progressive disclosure — the file listing injected each turn, read on demand with the store's own
+ * tool — plus keyword-based search via `search_memory` (registered by {@link MemoryManager}).
  *
- * Consolidation is a separate concern and lives under `consolidation/`: this file holds the public
- * {@link FileMemoryStore.consolidate} entry point and the run's orchestration, delegating planning,
- * validation, and execution to those modules.
+ * Two concerns live in their own modules: progressive disclosure in `disclosure.ts` (the injector
+ * plugin and read tool), and consolidation under `consolidation/`. This file holds the store itself —
+ * the storage layout both depend on — plus the public {@link FileMemoryStore.consolidate} entry point
+ * and its run orchestration.
  */
 
 import type { JSONValue } from '../../types/json.js'
 import type { MemoryEntry, MemoryStore, SearchOptions } from '../../memory/types.js'
 import type { ExtractionConfig } from '../../memory/extraction/types.js'
+import type { Plugin } from '../../plugins/plugin.js'
 import type { Storage } from '../../storage/storage.js'
+import type { Tool } from '../../tools/tool.js'
 import type { ConsolidateConfig, FileMemoryStoreConfig } from './types.js'
 import { CONSOLIDATE_OPERATIONS } from './types.js'
 import { LocalFileStorage } from '../../storage/local-file-storage.js'
-import { NAMESPACED, namespace, normalizeKey } from '../../storage/storage.js'
+import { NAMESPACED, namespace } from '../../storage/storage.js'
 import { DEFAULT_MAX_SEARCH_RESULTS, tokenize, tokenOverlapScore } from '../../memory/search/keyword.js'
 import {
-  CONSOLIDATION_CHANGELOG,
-  containsDotSegments,
+  assertKnowledgePath,
   decoder,
   encoder,
   isConsolidationChangelog,
@@ -28,6 +31,7 @@ import {
   parseFrontmatter,
   STORAGE_READ_CONCURRENCY,
 } from './internal.js'
+import { createDisclosureInjector, createReadTool } from './disclosure.js'
 import { generatePlan } from './consolidation/planner.js'
 import { executePlan, readAllFiles, recordChangelog } from './consolidation/execute.js'
 
@@ -62,8 +66,13 @@ function slugify(text: string): string {
  * A file-based memory store backed by the unified {@link Storage} interface.
  *
  * Implements {@link MemoryStore} for use with {@link MemoryManager}. Knowledge is stored as
- * markdown files with YAML frontmatter under a `memory/` storage namespace. Retrieval is via the
- * `search_memory` tool registered by {@link MemoryManager}, which calls {@link search} (keyword-based).
+ * markdown files with YAML frontmatter under a `memory/` storage namespace.
+ *
+ * Retrieval is by progressive disclosure: the store injects the file listing — every file's path and
+ * description — each turn, and registers a read tool named after it, so the model judges what is
+ * relevant and pulls only that. Since the listing is a better map of memory than a keyword search's
+ * top hits and both would compete for context, pair the store with the manager's `injection: false`;
+ * `search_memory` (which calls {@link search}) stays the fallback for looking inside file bodies.
  *
  * The storage backend defaults to {@link LocalFileStorage} when no custom {@link Storage}
  * implementation is provided. Keys are auto-scoped under `memory/<name>/` (so a store named
@@ -93,6 +102,7 @@ export class FileMemoryStore implements MemoryStore {
   readonly extraction?: boolean | ExtractionConfig
 
   private readonly _storage: Storage
+  private readonly _disclosure: boolean
 
   /**
    * Guards against overlapping {@link consolidate} runs on this instance. Set synchronously before
@@ -111,6 +121,7 @@ export class FileMemoryStore implements MemoryStore {
     if (config.description !== undefined) this.description = config.description
     if (config.maxSearchResults !== undefined) this.maxSearchResults = config.maxSearchResults
     if (config.extraction !== undefined) this.extraction = config.extraction
+    this._disclosure = config.disclosure ?? true
     this._storage = this._resolveStorage(config.storage ?? new LocalFileStorage())
   }
 
@@ -173,6 +184,58 @@ export class FileMemoryStore implements MemoryStore {
   }
 
   /**
+   * List every knowledge file's path and description, without their content. This is the listing
+   * progressive disclosure injects: enough for the model to judge what is worth opening, at a
+   * fraction of the tokens the content would cost. Paths are what the store's read tool accepts.
+   *
+   * Sorted by path so the listing is stable across turns, keeping it cacheable. Excludes the
+   * consolidation changelog, and skips files whose read fails rather than failing the whole listing.
+   *
+   * @returns Every knowledge file's path and description, sorted by path
+   */
+  async listFiles(): Promise<{ path: string; description: string }[]> {
+    const allKeys = await this._storage.list('')
+
+    const infos = await mapWithConcurrency(allKeys, STORAGE_READ_CONCURRENCY, async (key) => {
+      if (isConsolidationChangelog(key)) return null
+      try {
+        const bytes = await this._storage.read(key)
+        if (!bytes) return null
+        const { description } = parseFrontmatter(decoder.decode(bytes))
+        return { path: key, description }
+      } catch {
+        return null
+      }
+    })
+
+    return infos
+      .filter((info): info is NonNullable<typeof info> => info !== null)
+      .sort((a, b) => a.path.localeCompare(b.path))
+  }
+
+  /**
+   * Returns the read tool — the on-demand half of progressive disclosure — which
+   * {@link MemoryManager} registers alongside its own. Read-only, so it is available on a
+   * `writable: false` store.
+   *
+   * @returns This store's read tool, named after it, or nothing when `disclosure` is off
+   */
+  getTools(): Tool[] {
+    return this._disclosure ? [createReadTool(this.name, this._storage)] : []
+  }
+
+  /**
+   * Returns the file-listing injector for {@link MemoryManager} to register, so progressive disclosure
+   * needs no wiring from the caller. Registration is independent of the manager's own `injection`
+   * setting, so the recommended `injection: false` setup still gets the listing.
+   *
+   * @returns The listing injector for this store, or nothing when `disclosure` is off
+   */
+  getPlugins(): Plugin[] {
+    return this._disclosure ? [createDisclosureInjector(this.name, () => this.listFiles())] : []
+  }
+
+  /**
    * Add a knowledge entry to the store.
    *
    * Writes a markdown file with YAML frontmatter. By default writes to `facts/` within the store's
@@ -208,21 +271,9 @@ export class FileMemoryStore implements MemoryStore {
       }
     }
 
-    // Canonicalize with the same helper the shipped backends apply internally, so the
-    // returned receipt matches the key search() and the backend's list() report.
-    const canonicalKey = normalizeKey(key)
-
-    // Reject single-dot path segments that normalizeKey does not strip. The OS collapses './' so
-    // a key like './consolidation-changelog.md' would alias the reserved changelog on disk despite
-    // failing the string-equality guard below. Consolidation's validatePath already rejects dots;
-    // this closes the same gap in the public add() path.
-    if (containsDotSegments(canonicalKey)) {
-      throw new Error("Path must not contain '.' segments: use a direct path without dot-directory references")
-    }
-
-    if (isConsolidationChangelog(canonicalKey)) {
-      throw new Error(`Path must not be the reserved '${CONSOLIDATION_CHANGELOG}' file`)
-    }
+    // Canonicalize with the same rules the read tool applies, so the returned receipt matches the key
+    // search() and the backend's list() report, and a written path is readable under one spelling.
+    const canonicalKey = assertKnowledgePath(key)
 
     const fileContent = `---\ndescription: ${JSON.stringify(description)}\n---\n\n${content}\n`
     await this._storage.write(canonicalKey, encoder.encode(fileContent))

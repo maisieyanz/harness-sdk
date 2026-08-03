@@ -1,6 +1,7 @@
 import type { JSONValue } from '../types/json.js'
 import type { MessageData } from '../types/messages.js'
 import type { Tool } from '../tools/tool.js'
+import type { Plugin } from '../plugins/plugin.js'
 import type { ExtractionConfig } from './extraction/types.js'
 import type { InjectionConfig } from '../injection/index.js'
 
@@ -161,6 +162,19 @@ export interface MemoryStore extends MemoryStoreConfig {
    * @returns Array of tools provided by this store
    */
   getTools?(): Tool[]
+  /**
+   * Returns plugins for the {@link MemoryManager} to register with the agent, letting a store reach any
+   * extension point a plugin can — hooks, middleware — without itself being a plugin the caller must
+   * pass to `Agent`. The counterpart to {@link getTools} for capabilities a tool cannot express, such
+   * as injecting context every turn via a `ContextInjector`.
+   *
+   * Independent of {@link MemoryManagerConfig.injection}, which governs only the manager's own
+   * search-based injection. The manager calls this once, then initializes each plugin and registers its
+   * {@link Plugin.getTools} alongside its own.
+   *
+   * @returns Array of plugins to register with the agent
+   */
+  getPlugins?(): Plugin[]
 }
 
 /**
