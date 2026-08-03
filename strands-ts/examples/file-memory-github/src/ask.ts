@@ -8,8 +8,7 @@
  * `injection: false` turns off the manager's own search-result injection: the listing is a better map
  * of memory than a keyword search's top hits, and both would compete for the same context budget.
  *
- * Usage:
- *   export GITHUB_TOKEN=... GITHUB_OWNER=... GITHUB_REPO=...
+ * Usage (credentials come from .env — see .env.example):
  *   npm run ask                       # uses the default question
  *   npm run ask -- "your question"
  */
@@ -33,10 +32,16 @@ async function main(): Promise<void> {
   heading('Step 2 — progressive disclosure')
   console.log(`Question: ${question}\n`)
 
+  const totalFiles = (await memoryStore.listFiles()).length
+
+  // Track distinct paths rather than call count, so a repeated read is not counted twice
+  const readPaths = new Set<string>()
   let answer = ''
   for await (const event of agent.stream(question)) {
     if (event.type === 'beforeToolCallEvent') {
       console.log(`  [tool] ${event.toolUse.name} ${JSON.stringify(event.toolUse.input)}`)
+      const path = (event.toolUse.input as { path?: string }).path
+      if (path) readPaths.add(path)
     }
     // Check the value, not just the key: a tool-use turn emits a text block whose `text` is undefined
     if (event.type === 'contentBlockEvent' && 'text' in event.contentBlock && event.contentBlock.text) {
@@ -47,14 +52,13 @@ async function main(): Promise<void> {
   heading('Answer')
   console.log(answer.trim())
 
+  const filesRead = readPaths.size
   console.log(
-    [
-      '\nThe agent read only the files whose descriptions looked relevant — the rest of the',
-      'corpus never entered its context. Note that it had to reconcile the tabs/spaces',
-      'contradiction itself, and had to read three separate files to answer one question',
-      'about testing. Consolidation is what removes that work.',
-      '\nNext: npm run consolidate\n',
-    ].join('\n')
+    `\nThe agent read ${filesRead} of ${totalFiles} files — the rest never entered its context.` +
+      '\nOn the freshly seeded corpus it also has to do work consolidation removes: reconciling the' +
+      '\ntabs/spaces contradiction itself, and reading three separate files to answer one question' +
+      '\nabout testing.' +
+      '\n\nNext: npm run consolidate\n'
   )
 }
 

@@ -41,12 +41,12 @@ You need a GitHub repo to use as the memory store, a token that can write to it,
 
 1. Create a repository (initialized with a README so the default branch exists).
 2. Create a fine-grained personal access token scoped to that repo with **Contents: Read and write**.
-3. Export the environment:
+3. Create your `.env` — the npm scripts load it automatically, so there is nothing to export per
+   shell. It is gitignored.
 
 ```bash
-export GITHUB_TOKEN=github_pat_...
-export GITHUB_OWNER=your-username
-export GITHUB_REPO=agent-memory-demo
+cp .env.example .env
+$EDITOR .env         # fill in GITHUB_TOKEN, GITHUB_OWNER, GITHUB_REPO
 ```
 
 4. Install and run:
@@ -57,6 +57,19 @@ npm start            # step 1 — seed
 npm run ask          # step 2 — progressive disclosure
 npm run consolidate  # step 3 — consolidate
 ```
+
+Environment variables already exported in your shell take precedence over `.env`, so you can override
+any single value inline — `MODEL_ID=... npm run ask` — without editing the file.
+
+### AWS credentials
+
+If the default AWS credential chain already resolves — a profile, an assumed role, an instance role —
+leave the `AWS_*` keys out of `.env` and it will be used as-is.
+
+If instead your access comes from short-lived session credentials, they expire in about an hour and a
+`403` mid-demo means it is time to refresh. `./refresh-env.sh` rewrites just the three `AWS_*` lines in
+`.env` and leaves the rest alone. It shells out to `aws configure export-credentials` by default; set
+`CREDENTIAL_COMMAND` in `.env` if your organization issues credentials some other way.
 
 ### Options
 

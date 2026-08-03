@@ -5,8 +5,7 @@
  * a duplicate pair, a contradiction, and a set of related facts that should collapse into one insight.
  * Every write is a commit, so the seeded state is inspectable on GitHub before consolidation runs.
  *
- * Usage:
- *   export GITHUB_TOKEN=... GITHUB_OWNER=... GITHUB_REPO=...
+ * Usage (credentials come from .env — see .env.example):
  *   npm start
  */
 

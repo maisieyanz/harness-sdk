@@ -7,9 +7,9 @@
     "prepare": "npm ci --prefix ../../..",
     "clean": "rm -rf dist node_modules package-lock.json",
     "build": "tsc",
-    "start": "tsc && node dist/seed.js",
-    "ask": "tsc && node dist/ask.js",
-    "consolidate": "tsc && node dist/consolidate.js"
+    "start": "tsc && node --env-file-if-exists=.env dist/seed.js",
+    "ask": "tsc && node --env-file-if-exists=.env dist/ask.js",
+    "consolidate": "tsc && node --env-file-if-exists=.env dist/consolidate.js"
   },
   "workspaces": [
     "../../"

@@ -6,8 +6,7 @@
  * whole run lands as a single commit, so the GitHub diff reads as one reviewable change rather than a
  * scatter of individual writes and deletes.
  *
- * Usage:
- *   export GITHUB_TOKEN=... GITHUB_OWNER=... GITHUB_REPO=...
+ * Usage (credentials come from .env — see .env.example):
  *   npm run consolidate
  */
 
