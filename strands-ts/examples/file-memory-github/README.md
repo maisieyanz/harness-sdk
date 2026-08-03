@@ -13,11 +13,16 @@ The demo runs in three steps, each its own process, so you can inspect the repo 
 
 ## What each step demonstrates
 
-**Progressive disclosure.** The store injects only the _listing_ each turn — every file's path and
-one-line description — and registers a `read_agent_memory_file` tool. The model decides what to open.
-In step 2 it reads 5 of 10 files; the other 5 never cost a token. This is why the store is paired with
-`injection: false`: the listing is a better map of memory than a keyword search's top hits, and both
-would compete for the same context budget.
+**Progressive disclosure.** This is the store's default retrieval mode, not something the demo turns
+on: `FileMemoryStore` hands the `MemoryManager` a plugin that injects the _listing_ each turn — every
+file's path and one-line description — and registers a `read_agent_memory_file` tool. Attach the store
+to an agent and you get both; step 2 is a separate command only so you can watch the tool calls, not
+because anything needs invoking. The model decides what to open, and on the seeded corpus it reads 5 of
+10 files; the other 5 never cost a token. Pass `disclosure: false` to opt out.
+
+The demo pairs the store with `injection: false` on the manager, which turns off its keyword-search
+injection. The listing is a better map of memory than a search's top hits, and both would compete for
+the same context budget.
 
 **Consolidation.** One structured-output call plans actions over the whole corpus, guardrails validate
 the entire plan, then deterministic code executes it. The seed contains three defects on purpose:
@@ -61,15 +66,10 @@ npm run consolidate  # step 3 — consolidate
 Environment variables already exported in your shell take precedence over `.env`, so you can override
 any single value inline — `MODEL_ID=... npm run ask` — without editing the file.
 
-### AWS credentials
-
-If the default AWS credential chain already resolves — a profile, an assumed role, an instance role —
-leave the `AWS_*` keys out of `.env` and it will be used as-is.
-
-If instead your access comes from short-lived session credentials, they expire in about an hour and a
-`403` mid-demo means it is time to refresh. `./refresh-env.sh` rewrites just the three `AWS_*` lines in
-`.env` and leaves the rest alone. It shells out to `aws configure export-credentials` by default; set
-`CREDENTIAL_COMMAND` in `.env` if your organization issues credentials some other way.
+AWS credentials are deliberately not part of `.env`. They resolve through the standard AWS chain, so
+whatever already works for the `aws` CLI works here — an exported set from your usual refresh command, a
+profile, or an instance role. Only `AWS_REGION` is in `.env`, because it is configuration rather than a
+credential.
 
 ### Options
 

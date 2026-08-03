@@ -1,9 +1,10 @@
 /**
  * Step 2 — ask the agent a question and watch progressive disclosure work.
  *
- * The store injects only the file listing — every path and its one-line description — and registers a
- * read tool. The model decides which files are worth opening and pays context only for those. The
- * tool calls printed below are that decision, made visible.
+ * Disclosure is the store's default, so attaching it to the agent is the whole setup: it injects the
+ * file listing — every path and its one-line description — and registers a read tool. The model decides
+ * which files are worth opening and pays context only for those. This is a separate script purely to
+ * print the tool calls, making that decision visible.
  *
  * `injection: false` turns off the manager's own search-result injection: the listing is a better map
  * of memory than a keyword search's top hits, and both would compete for the same context budget.
