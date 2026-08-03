@@ -7,7 +7,7 @@ The demo runs in three steps, each its own process, so you can inspect the repo 
 
 | Step | Command               | What it shows                                                    |
 | ---- | --------------------- | ---------------------------------------------------------------- |
-| 1    | `npm start`           | Seeding — 10 knowledge files, one commit                         |
+| 1    | `npm start`           | Seeding — 9 knowledge files, one commit                          |
 | 2    | `npm run ask`         | Progressive disclosure — the agent opens only the files it needs |
 | 3    | `npm run consolidate` | Consolidation — an offline pass that fixes the corpus            |
 
@@ -18,7 +18,7 @@ on: `FileMemoryStore` hands the `MemoryManager` a plugin that injects the _listi
 file's path and one-line description — and registers a `read_agent_memory_file` tool. Attach the store
 to an agent and you get both; step 2 is a separate command only so you can watch the tool calls, not
 because anything needs invoking. The model decides what to open, and on the seeded corpus it reads 5 of
-10 files; the other 5 never cost a token. Pass `disclosure: false` to opt out.
+9 files; the other 4 never cost a token. Pass `disclosure: false` to opt out.
 
 The demo pairs the store with `injection: false` on the manager, which turns off its keyword-search
 injection. The listing is a better map of memory than a search's top hits, and both would compete for
@@ -33,12 +33,12 @@ the entire plan, then deterministic code executes it. The seed contains three de
 | Contradiction   | `indentation-tabs` (March) vs `indentation-spaces` (June) | keep the June fact, delete the stale one |
 | Scattered facts | three `testing-*` files                                   | synthesize one philosophy file           |
 
-A run takes the store from 10 files to 6, and writes `consolidation-changelog.md` recording every
-action with the model's reasoning.
+A run takes the store from 9 files to 5, and writes `consolidation-changelog.md` recording every action
+with the model's reasoning. The model chooses the merged filenames, so they vary between runs.
 
 **Atomic commits.** `GithubStorage.beginBatch()` / `commitBatch()` buffer a multi-file change into a
-single commit. Without it, seeding would be 10 commits and consolidation another 9. With it, the
-consolidation diff reads as one reviewable change.
+single commit. Without it, seeding would be 9 commits and consolidation another 8 — it touches eight
+paths (two writes, five deletes, and the changelog). With it, the whole run is one reviewable diff.
 
 ## Setup
 
@@ -89,18 +89,34 @@ repo:
 ```
 your-repo/
 └── memory/agent-memory/
-    ├── system/persona.md          # role and constraints
-    ├── facts/…                    # what the agent has learned
-    ├── skills/…                   # procedural knowledge
+    ├── facts/…                    # every knowledge file
     └── consolidation-changelog.md # audit trail, excluded from the listing
 ```
 
-The changelog is deliberately excluded from the listing, from search, and from consolidation's own
-input — it is an audit artifact, not knowledge.
+Paths are otherwise arbitrary — the store imposes no taxonomy. It gives meaning to exactly two keys:
+`facts/` is where `add()` writes an entry that carries no explicit path, and
+`consolidation-changelog.md` is reserved. The changelog is excluded from the listing, from search, and
+from consolidation's own input, because it is an audit artifact rather than knowledge; `add()` rejects
+any attempt to write to it.
+
+The seed puts everything under `facts/` for that reason. Group files however suits your domain — just
+know that a directory name carries no behavior, so nesting is for your benefit when reading the repo,
+not a signal to the store.
 
 ## Resetting
 
-Delete the `memory/` directory and commit; the next `npm start` reseeds from scratch.
+Each step assumes the one before it, so re-run them from a clean store. Delete `memory/` and commit;
+the next `npm start` reseeds from scratch:
+
+```bash
+gh repo clone <owner>/<repo> /tmp/reset -- --depth 1
+git -C /tmp/reset rm -rq memory
+git -C /tmp/reset commit -m "reset: clear memory store"
+git -C /tmp/reset push
+```
+
+Running `npm run ask` against an already-consolidated store still works, but it reads fewer files and
+the defects it would otherwise have to reconcile are gone.
 
 ## A note on the listing right after a push
 

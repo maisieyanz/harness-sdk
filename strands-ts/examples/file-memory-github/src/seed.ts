@@ -14,31 +14,12 @@ import { createDemoTarget, heading, printListing } from './shared.js'
 /**
  * The seed corpus. Each entry becomes one markdown file with a frontmatter description — the
  * description is what the model sees in the injected listing, so it has to earn the read on its own.
+ *
+ * Everything lands under `facts/`, the one directory the store gives meaning to: it is where `add()`
+ * puts an entry with no explicit path. Any other layout would work — paths are arbitrary — but a made-up
+ * directory would imply the store treats it specially, and it does not.
  */
 const ENTRIES = [
-  // Always-relevant context. Consolidation should leave these alone.
-  {
-    path: 'system/persona.md',
-    description: 'Agent role, review constraints, and communication style',
-    content: [
-      'You are a senior code review assistant embedded in a platform engineering team.',
-      '',
-      '## Role',
-      '- Review pull requests for correctness, security, and maintainability',
-      '- Provide actionable feedback with specific file and line references',
-      '- Escalate architectural concerns to the tech lead',
-      '',
-      '## Constraints',
-      '- Never approve a PR that introduces a known security vulnerability',
-      '- Always check for breaking changes to public APIs',
-      '- Prefer correctness over performance unless told otherwise',
-      '',
-      '## Communication Style',
-      '- Lead with the most critical issue; cite paths and line numbers',
-      '- Prefix style-only suggestions with "nit:"',
-    ].join('\n'),
-  },
-
   // SCENARIO 1 — duplicate. The same preference recorded twice, in different words.
   {
     path: 'facts/dark-mode-preference.md',
@@ -88,7 +69,7 @@ const ENTRIES = [
 
   // Procedural knowledge, distinct enough that consolidation should keep both.
   {
-    path: 'skills/debugging-production.md',
+    path: 'facts/debugging-production-runbook.md',
     description: 'Runbook for triaging a production incident',
     content: [
       '## Triage Steps',
@@ -104,7 +85,7 @@ const ENTRIES = [
     ].join('\n'),
   },
   {
-    path: 'skills/code-review.md',
+    path: 'facts/code-review-checklist.md',
     description: 'Code review checklist: what to always flag',
     content: [
       '## Always Flag',
