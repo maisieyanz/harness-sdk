@@ -3,7 +3,28 @@
 `FileMemoryStore` backed by a GitHub repository. Memory is markdown files in a real repo, so every
 change to what the agent knows is a commit you can diff, review, blame, and revert.
 
-The demo runs in three steps, each its own process, so you can inspect the repo on GitHub in between:
+There are two ways to run it.
+
+**`npm run demo`** — one interactive session. Ask questions, and drive the demo beats with commands:
+
+| Command        | What it does                           |
+| -------------- | -------------------------------------- |
+| `/seed`        | write the 9-file corpus (one commit)   |
+| `/list`        | print the injected file listing        |
+| `/consolidate` | run a consolidation pass (one commit)  |
+| `/changelog`   | print `consolidation-changelog.md`     |
+| `/repo`        | print the repo and commit-history URLs |
+| `/help`        | the command list                       |
+| `/quit`        | leave                                  |
+
+One agent serves the whole session, so its message history carries across turns. That is what the
+three scripts below cannot show: follow-up questions work, and because a file already read stays in
+context while the listing is re-injected each turn, asking twice about one topic reads the files once —
+the second turn reports reading 0 files. Chat is read-only, so the seeded corpus stays exactly as
+written and `/consolidate` acts on precisely the planted defects.
+
+**Three separate scripts** — the same beats as one-shot processes, each its own agent, so you can
+inspect the repo on GitHub in between:
 
 | Step | Command               | What it shows                                                    |
 | ---- | --------------------- | ---------------------------------------------------------------- |
@@ -58,6 +79,9 @@ $EDITOR .env         # fill in GITHUB_TOKEN, GITHUB_OWNER, GITHUB_REPO
 
 ```bash
 npm install
+npm run demo         # interactive session — /seed, ask questions, /consolidate
+
+# or the same beats as separate processes
 npm start            # step 1 — seed
 npm run ask          # step 2 — progressive disclosure
 npm run consolidate  # step 3 — consolidate
@@ -106,7 +130,8 @@ not a signal to the store.
 ## Resetting
 
 Each step assumes the one before it, so re-run them from a clean store. Delete `memory/` and commit;
-the next `npm start` reseeds from scratch:
+the next `npm start` (or `/seed`) reseeds from scratch. `/seed` refuses to write into a non-empty
+store, so a stale corpus surfaces as a message rather than a confusing double-seed:
 
 ```bash
 gh repo clone <owner>/<repo> /tmp/reset -- --depth 1

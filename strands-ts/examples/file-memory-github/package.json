@@ -7,6 +7,7 @@
     "prepare": "npm ci --prefix ../../..",
     "clean": "rm -rf dist node_modules package-lock.json",
     "build": "tsc",
+    "demo": "tsc && node --env-file-if-exists=.env dist/demo.js",
     "start": "tsc && node --env-file-if-exists=.env dist/seed.js",
     "ask": "tsc && node --env-file-if-exists=.env dist/ask.js",
     "consolidate": "tsc && node --env-file-if-exists=.env dist/consolidate.js"
