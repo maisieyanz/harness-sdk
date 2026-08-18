@@ -7,7 +7,7 @@
 
 import type { Storage } from '@strands-agents/sdk/storage'
 import { BedrockModel } from '@strands-agents/sdk'
-import { FileMemoryStore } from '@strands-agents/sdk/vended-memory-stores/file-memory-store'
+import { FileMemoryStore, type FileMemoryStoreConfig } from '@strands-agents/sdk/vended-memory-stores/file-memory-store'
 import { GithubStorage } from '@strands-agents/sdk/storage'
 
 /** The store name, which also scopes keys under `memory/<name>/` inside the repo. */
@@ -42,15 +42,25 @@ export interface DemoTarget {
   memoryStore: FileMemoryStore
 }
 
+/** Overrides applied to the store the demo builds. */
+export interface DemoTargetOptions {
+  /**
+   * Automatic-extraction config, for a session that writes memory from conversation. Omitted by the
+   * one-shot scripts, which only read or write explicitly.
+   */
+  extraction?: FileMemoryStoreConfig['extraction']
+}
+
 /**
  * Builds the GitHub-backed store from the environment.
  *
  * Namespacing is applied here rather than left to the store so the demo can read store-relative keys
  * through the same view; the store detects the pre-scoped storage and does not prefix it twice.
  *
+ * @param options - Store overrides; pass `extraction` to have conversation write memory
  * @returns The repo coordinates plus the storage backend and the memory store over it
  */
-export function createDemoTarget(): DemoTarget {
+export function createDemoTarget(options?: DemoTargetOptions): DemoTarget {
   const token = requiredEnv('GITHUB_TOKEN')
   const owner = requiredEnv('GITHUB_OWNER')
   const repo = requiredEnv('GITHUB_REPO')
@@ -58,7 +68,11 @@ export function createDemoTarget(): DemoTarget {
 
   const storage = new GithubStorage({ owner, repo, branch, token })
   const scoped = storage.namespace(STORE_PREFIX)
-  const memoryStore = new FileMemoryStore({ name: STORE_NAME, storage: scoped })
+  const memoryStore = new FileMemoryStore({
+    name: STORE_NAME,
+    storage: scoped,
+    ...(options?.extraction !== undefined && { extraction: options.extraction }),
+  })
 
   return { owner, repo, branch, storage, scoped, memoryStore }
 }

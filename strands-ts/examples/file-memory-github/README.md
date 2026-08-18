@@ -7,21 +7,63 @@ There are two ways to run it.
 
 **`npm run demo`** — one interactive session. Ask questions, and drive the demo beats with commands:
 
-| Command        | What it does                           |
-| -------------- | -------------------------------------- |
-| `/seed`        | write the 9-file corpus (one commit)   |
-| `/list`        | print the injected file listing        |
-| `/consolidate` | run a consolidation pass (one commit)  |
-| `/changelog`   | print `consolidation-changelog.md`     |
-| `/repo`        | print the repo and commit-history URLs |
-| `/help`        | the command list                       |
-| `/quit`        | leave                                  |
+| Command        | What it does                                                  |
+| -------------- | ------------------------------------------------------------- |
+| `/learn`       | start writing memory from conversation (`/learn off` to stop) |
+| `/seed`        | write the 9-file corpus (one commit)                          |
+| `/list`        | print the injected file listing                               |
+| `/read <path>` | walk through disclosure on one file, no model call            |
+| `/consolidate` | run a consolidation pass (one commit)                         |
+| `/changelog`   | print `consolidation-changelog.md`                            |
+| `/repo`        | print the repo and commit-history URLs                        |
+| `/help`        | the command list                                              |
+| `/quit`        | leave                                                         |
 
 One agent serves the whole session, so its message history carries across turns. That is what the
 three scripts below cannot show: follow-up questions work, and because a file already read stays in
 context while the listing is re-injected each turn, asking twice about one topic reads the files once —
-the second turn reports reading 0 files. Chat is read-only, so the seeded corpus stays exactly as
-written and `/consolidate` acts on precisely the planted defects.
+the second turn reports reading 0 files.
+
+**Memory forming live.** `/learn` turns on automatic extraction, so a durable fact stated in
+conversation becomes a committed markdown file after that turn:
+
+```
+> /learn
+  extraction ON — facts from this conversation will be committed after each turn
+
+> I always use Vitest for tests, never Jest
+  [memory] + facts/user-always-uses-vitest-for-tests-never-jest.md — User always uses Vitest for tests, never Jest
+```
+
+Ask about test runners on a later turn and the model reads that file back. A turn holding no durable
+fact reports `nothing worth keeping` — extraction declining to write is part of the behavior too.
+
+Extraction is off by default, and `/learn off` returns to read-only. A write mid-session would change
+the corpus `/consolidate` acts on, and the planted defects are the point of that step — so keep it off
+while demonstrating consolidation.
+
+**Disclosure, step by step.** `/read` shows the two halves of progressive disclosure without a model
+call — instant, deterministic, and useful for narrating the mechanism before letting the model drive it:
+
+```
+> /read facts/indentation-spaces.md
+
+  1. Injected every turn — the model sees this much for free:
+     facts/code-review-checklist.md — "Code review checklist: what to always flag"
+     …
+
+  2. The model calls read_agent_memory_file({ path: 'facts/indentation-spaces.md' }):
+     {
+       "path": "facts/indentation-spaces.md",
+       "description": "Indentation preference: 2 spaces (updated June 2026, supersedes tabs)",
+       "content": "User switched to 2-space indentation as of June 2026. …"
+     }
+```
+
+Step 2 invokes the store's actual read tool — the same one `getTools()` hands the agent — so the JSON is
+the real tool result. Step 1 is rebuilt from `listFiles()` and mirrors the injected format rather than
+being byte-identical, because the injector keeps its renderer private. `/read` with no path shows only
+the listing; a path that isn't in it produces the same error the model would get.
 
 **Three separate scripts** — the same beats as one-shot processes, each its own agent, so you can
 inspect the repo on GitHub in between:
@@ -129,9 +171,12 @@ not a signal to the store.
 
 ## Resetting
 
-Each step assumes the one before it, so re-run them from a clean store. Delete `memory/` and commit;
-the next `npm start` (or `/seed`) reseeds from scratch. `/seed` refuses to write into a non-empty
-store, so a stale corpus surfaces as a message rather than a confusing double-seed:
+`/seed` overwrites any file at a seeded path, so it is safe to re-run — after a `/learn` beat, or to
+restore the planted defects mid-session. Files it does not name are left in place and it says so, since
+consolidation will then consider those too and may do more than the three documented fixes.
+
+For a genuinely clean store — no leftover `/learn` facts, no consolidated files from an earlier run —
+delete `memory/` and commit; the next `npm start` or `/seed` starts from nothing:
 
 ```bash
 gh repo clone <owner>/<repo> /tmp/reset -- --depth 1
